@@ -331,6 +331,109 @@ MADT::LAPICOverride::prepareBuf(std::vector<uint8_t>& mem) const
     Record::prepareBuf(mem);
 }
 
+//// SRAT
+SRAT::SRAT::SRAT(const Params &p)
+    : SysDescTable(p, "SRAT", 3), records(p.records)
+{}
+
+Addr
+SRAT::SRAT::writeBuf(PortProxy &phys_proxy, Allocator &alloc,
+                     std::vector<uint8_t> &mem) const
+{
+    assert(mem.empty());
+    mem.resize(sizeof(Mem));
+
+    Mem *header = reinterpret_cast<Mem *>(mem.data());
+    header->tableRevision = params().table_revision;
+
+    for (const auto &record : records) {
+        auto entry = record->prepare();
+        mem.insert(mem.end(), entry.begin(), entry.end());
+    }
+
+    DPRINTF(ACPI, "SRAT: writing %d records (size: %d)\n", records.size(),
+            mem.size());
+
+    return SysDescTable::writeBuf(phys_proxy, alloc, mem);
+}
+
+void
+SRAT::Record::prepareBuf(std::vector<uint8_t> &mem) const
+{
+    assert(mem.size() >= sizeof(Mem));
+    DPRINTF(ACPI, "SRAT: writing record type %d (size: %d)\n", type,
+            mem.size());
+
+    Mem *header = reinterpret_cast<Mem *>(mem.data());
+    header->type = type;
+    header->length = mem.size();
+}
+
+void
+SRAT::ProcessorLocalApic::prepareBuf(std::vector<uint8_t> &mem) const
+{
+    assert(mem.empty());
+    mem.resize(sizeof(Mem));
+
+    const uint32_t domain = params().proximity_domain;
+    Mem *data = reinterpret_cast<Mem *>(mem.data());
+    data->proximityDomainLo = domain & 0xff;
+    data->apicId = params().apic_id;
+    data->flags = params().flags;
+    data->localSapicEid = params().local_sapic_eid;
+    data->proximityDomainHi[0] = (domain >> 8) & 0xff;
+    data->proximityDomainHi[1] = (domain >> 16) & 0xff;
+    data->proximityDomainHi[2] = (domain >> 24) & 0xff;
+    data->clockDomain = params().clock_domain;
+
+    Record::prepareBuf(mem);
+}
+
+void
+SRAT::MemoryAffinity::prepareBuf(std::vector<uint8_t> &mem) const
+{
+    assert(mem.empty());
+    mem.resize(sizeof(Mem));
+
+    Mem *data = reinterpret_cast<Mem *>(mem.data());
+    data->proximityDomain = params().proximity_domain;
+    data->baseAddress = params().base_address;
+    data->addressLength = params().address_length;
+    data->flags = params().flags;
+
+    Record::prepareBuf(mem);
+}
+
+//// SLIT
+SLIT::SLIT(const Params &p) : SysDescTable(p, "SLIT", 1)
+{}
+
+Addr
+SLIT::writeBuf(PortProxy &phys_proxy, Allocator &alloc,
+               std::vector<uint8_t> &mem) const
+{
+    assert(mem.empty());
+
+    const uint64_t count = params().locality_count;
+    fatal_if(count == 0, "SLIT locality_count must be non-zero.");
+    fatal_if(params().distances.size() != count * count,
+             "SLIT distance matrix has %zu entries, expected %llu.",
+             params().distances.size(),
+             static_cast<unsigned long long>(count * count));
+
+    mem.resize(sizeof(Mem));
+    Mem *header = reinterpret_cast<Mem *>(mem.data());
+    header->localityCount = count;
+
+    mem.insert(mem.end(), params().distances.begin(),
+               params().distances.end());
+
+    DPRINTF(ACPI, "SLIT: writing %llu localities (size: %d)\n",
+            static_cast<unsigned long long>(count), mem.size());
+
+    return SysDescTable::writeBuf(phys_proxy, alloc, mem);
+}
+
 } // namespace ACPI
 
 } // namespace X86ISA

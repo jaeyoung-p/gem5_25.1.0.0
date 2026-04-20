@@ -375,7 +375,7 @@ FsWorkload::initState()
     cr0.pg = 1;
     tc->setMiscReg(misc_reg::Cr0, cr0);
 
-    tc->pcState(kernelObj->entryPoint());
+    tc->pcState(getEntry());
 
     // We should now be in long mode. Yay!
 

@@ -47,7 +47,10 @@ class Directory(MESI_Two_Level_Directory_Controller):
         self._cache_line_size = cache_line_size
         self.connectQueues(network)
 
-        self.addr_ranges = [mem_range]
+        if isinstance(mem_range, (list, tuple)):
+            self.addr_ranges = list(mem_range)
+        else:
+            self.addr_ranges = [mem_range]
         self.directory = RubyDirectoryMemory(block_size=cache_line_size)
         # Connect this directory to the memory side.
         self.memory_out_port = port

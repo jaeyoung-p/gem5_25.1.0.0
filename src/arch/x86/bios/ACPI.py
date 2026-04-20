@@ -137,6 +137,54 @@ class X86ACPIMadtLAPICOverride(X86ACPIMadtRecord):
     address = Param.Addr(0, "64-bit Physical Address of Local APIC")
 
 
+class X86ACPISratRecord(SimObject):
+    type = "X86ACPISratRecord"
+    cxx_class = "gem5::X86ISA::ACPI::SRAT::Record"
+    cxx_header = "arch/x86/bios/acpi.hh"
+    abstract = True
+
+
+class X86ACPISrat(X86ACPISysDescTable):
+    type = "X86ACPISrat"
+    cxx_class = "gem5::X86ISA::ACPI::SRAT::SRAT"
+    cxx_header = "arch/x86/bios/acpi.hh"
+
+    table_revision = Param.UInt32(1, "SRAT table revision")
+    records = VectorParam.X86ACPISratRecord([], "Records in this SRAT")
+
+
+class X86ACPISratProcessorLocalApic(X86ACPISratRecord):
+    type = "X86ACPISratProcessorLocalApic"
+    cxx_header = "arch/x86/bios/acpi.hh"
+    cxx_class = "gem5::X86ISA::ACPI::SRAT::ProcessorLocalApic"
+
+    proximity_domain = Param.UInt32(0, "NUMA proximity domain")
+    apic_id = Param.UInt8(0, "APIC ID")
+    flags = Param.UInt32(1, "Affinity flags")
+    local_sapic_eid = Param.UInt8(0, "Local SAPIC EID")
+    clock_domain = Param.UInt32(0, "Clock domain")
+
+
+class X86ACPISratMemoryAffinity(X86ACPISratRecord):
+    type = "X86ACPISratMemoryAffinity"
+    cxx_header = "arch/x86/bios/acpi.hh"
+    cxx_class = "gem5::X86ISA::ACPI::SRAT::MemoryAffinity"
+
+    proximity_domain = Param.UInt32(0, "NUMA proximity domain")
+    base_address = Param.Addr(0, "Memory range base address")
+    address_length = Param.Addr(0, "Memory range length")
+    flags = Param.UInt32(1, "Affinity flags")
+
+
+class X86ACPISlit(X86ACPISysDescTable):
+    type = "X86ACPISlit"
+    cxx_class = "gem5::X86ISA::ACPI::SLIT"
+    cxx_header = "arch/x86/bios/acpi.hh"
+
+    locality_count = Param.UInt64(0, "Number of NUMA localities")
+    distances = VectorParam.UInt8([], "Flattened locality distance matrix")
+
+
 # Root System Description Pointer Structure
 class X86ACPIRSDP(SimObject):
     type = "X86ACPIRSDP"

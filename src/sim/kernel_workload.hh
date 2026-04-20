@@ -83,7 +83,11 @@ class KernelWorkload : public Workload
 
     KernelWorkload(const Params &p);
 
-    Addr getEntry() const override { return kernelObj->entryPoint(); }
+    Addr
+    getEntry() const override
+    {
+        return (kernelObj->entryPoint() & _loadAddrMask) + _loadAddrOffset;
+    }
     ByteOrder byteOrder() const override { return kernelObj->getByteOrder(); }
     loader::Arch
     getArch() const override

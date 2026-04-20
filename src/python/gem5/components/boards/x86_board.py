@@ -287,22 +287,19 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
         self.workload.acpi_description_table_pointer.oem_id = "gem5"
         self.workload.acpi_description_table_pointer.rsdt.oem_id = "gem5"
         self.workload.acpi_description_table_pointer.xsdt.oem_id = "gem5"
+
         entries = [
             # Mark the first megabyte of memory as reserved
             X86E820Entry(addr=0, size="639KiB", range_type=1),
             X86E820Entry(addr=0x9FC00, size="385KiB", range_type=2),
-            # Mark the rest of physical memory as available
             X86E820Entry(
                 addr=0x100000,
-                size=f"{self.mem_ranges[0].size() - 0x100000:d}B",
+                size="%dB" % (self.mem_ranges[0].size() - 0x100000),
                 range_type=1,
             ),
+            # Reserve the last 64KiB of the 32-bit address space for m5ops.
+            X86E820Entry(addr=0xFFFF0000, size="64KiB", range_type=2),
         ]
-
-        # Reserve the last 16KiB of the 32-bit address space for m5ops
-        entries.append(
-            X86E820Entry(addr=0xFFFF0000, size="64KiB", range_type=2)
-        )
 
         self.workload.e820_table.entries = entries
 
@@ -375,12 +372,12 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload, SEBinaryWorkload):
                 "X86Board currently only supports memory sizes up "
                 "to 3GiB because of the I/O hole."
             )
-        data_range = AddrRange(memory.get_size())
-        memory.set_memory_range([data_range])
+
+        memory.set_memory_range([AddrRange(memory.get_size())])
 
         # Add the address range for the IO
         self.mem_ranges = [
-            data_range,  # All data
+            AddrRange(memory.get_size()),
             AddrRange(0xC0000000, size=0x100000),  # For I/0
         ]
 

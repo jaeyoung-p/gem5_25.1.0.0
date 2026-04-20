@@ -63,6 +63,7 @@ PySource('gem5.components.boards.experimental',
 PySource('gem5.components.boards', 'gem5/components/boards/simple_board.py')
 PySource('gem5.components.boards', 'gem5/components/boards/test_board.py')
 PySource('gem5.components.boards', 'gem5/components/boards/x86_board.py')
+PySource('gem5.components.boards', 'gem5/components/boards/large_mem_x86.py')
 PySource('gem5.components.boards', 'gem5/components/boards/arm_board.py')
 PySource('gem5.components.boards',
     "gem5/components/boards/kernel_disk_workload.py")
@@ -242,6 +243,8 @@ PySource('gem5.components.memory', 'gem5/components/memory/memory.py')
 PySource('gem5.components.memory', 'gem5/components/memory/single_channel.py')
 PySource('gem5.components.memory', 'gem5/components/memory/multi_channel.py')
 PySource('gem5.components.memory', 'gem5/components/memory/hbm.py')
+PySource('gem5.components.memory', 'gem5/components/memory/split_range.py')
+PySource('gem5.components.memory', 'gem5/components/memory/tiered.py')
 PySource('gem5.components.memory.dram_interfaces',
     'gem5/components/memory/dram_interfaces/__init__.py')
 PySource('gem5.components.memory.dram_interfaces',

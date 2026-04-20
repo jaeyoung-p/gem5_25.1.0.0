@@ -234,6 +234,24 @@ class DDR5_6400_4x8(DDR5_4400_4x8):
     tWTR = "16.251ns"
 
 
+class DDR5_6400_4x8_32GiB(DDR5_6400_4x8):
+    """One 32-bit DDR5-6400 subchannel with 32GiB modeled capacity.
+
+    gem5's DDR5 classes model a single 32-bit DDR5 subchannel. This density
+    variant represents one subchannel of a 64GiB dual-rank x8 DIMM: two such
+    subchannels make the 64-bit DIMM data path. The timing parameters remain
+    inherited from DDR5_6400_4x8; only device density and rank count are
+    adjusted so assigned address capacity matches the modeled interface.
+    """
+
+    # 32Gb x8 devices: 4GiB per device.
+    device_size = "4GiB"
+
+    # Four x8 devices make one x32 subchannel rank; two ranks make 32GiB.
+    devices_per_rank = 4
+    ranks_per_channel = 2
+
+
 # Maximum bandwidth of DDR5_8400_4x8 (8400 MT/s) can be 33.6GB/s
 # Most of the timing parameters for DDR5_8400_4x8 are TBD in
 # the datasheet referred above.

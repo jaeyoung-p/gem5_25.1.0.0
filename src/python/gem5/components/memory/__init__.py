@@ -41,6 +41,8 @@ from .single_channel import (
     SingleChannelHBM,
     SingleChannelLPDDR3_1600,
 )
+from .split_range import SplitRangeChanneledMemory
+from .tiered import TwoTierMemory
 
 try:
     from .dramsys import (
