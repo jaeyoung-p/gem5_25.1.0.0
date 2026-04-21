@@ -8,11 +8,53 @@
 #include <algorithm>
 #include <cmath>
 
+#include "base/cprintf.hh"
 #include "base/logging.hh"
+#include "base/trace.hh"
 #include "debug/CxlMemLink.hh"
 
 namespace gem5
 {
+
+bool
+CxlMemLink::ProtocolMessage::dataBearing() const
+{
+    return dataSlotsTotal != 0 || trailerSlotsTotal != 0;
+}
+
+uint64_t
+CxlMemLink::ProtocolMessage::remainingDataSlots() const
+{
+    return dataSlotsTotal - dataSlotsSent;
+}
+
+uint64_t
+CxlMemLink::ProtocolMessage::remainingTrailerSlots() const
+{
+    return trailerSlotsTotal - trailerSlotsSent;
+}
+
+bool
+CxlMemLink::ProtocolMessage::complete() const
+{
+    return headerSent && remainingDataSlots() == 0 &&
+           remainingTrailerSlots() == 0;
+}
+
+CxlMemLink::DirectionState::DirectionState(CxlMemLink &link,
+                                           LinkDirection _direction,
+                                           Tick _base_latency,
+                                           uint64_t _queue_depth,
+                                           const std::string &event_name)
+    : direction(_direction),
+      baseLatency(_base_latency),
+      queueDepthFlits(_queue_depth),
+      emitEvent(
+          [&link, _direction] {
+              link.processDirectionFlit(link.directionState(_direction));
+          },
+          event_name)
+{}
 
 CxlMemLink::CxlRequestPort::CxlRequestPort(const std::string &name,
                                            CxlMemLink &_link, PortID _port_id)
@@ -45,29 +87,29 @@ CxlMemLink::CxlMemLink(const Params &p)
       responseHeaderFlits(p.response_header_flits),
       m2sQueueDepthFlits(p.m2s_queue_depth_flits),
       s2mQueueDepthFlits(p.s2m_queue_depth_flits),
-      nextM2SReady(0),
-      nextS2MReady(0),
+      m2sState(*this, LinkDirection::M2S, m2sLatency, m2sQueueDepthFlits,
+               csprintf("%s.m2s_emit", name())),
+      s2mState(*this, LinkDirection::S2M, s2mLatency, s2mQueueDepthFlits,
+               csprintf("%s.s2m_emit", name())),
       lastM2SQueueUpdate(0),
       lastS2MQueueUpdate(0),
-      queuedM2SFlits(0),
-      queuedS2MFlits(0),
       reservedS2MFlits(0),
       ADD_STAT(m2sPackets, statistics::units::Count::get(),
                "CXL.mem M2S packets accepted by the link"),
       ADD_STAT(s2mPackets, statistics::units::Count::get(),
                "CXL.mem S2M packets accepted by the link"),
       ADD_STAT(m2sFlits, statistics::units::Count::get(),
-               "CXL.mem M2S flits serialized by the link"),
+               "CXL.mem M2S 256B flits emitted by the link"),
       ADD_STAT(s2mFlits, statistics::units::Count::get(),
-               "CXL.mem S2M flits serialized by the link"),
+               "CXL.mem S2M 256B flits emitted by the link"),
       ADD_STAT(m2sQueueWaitTicks, statistics::units::Tick::get(),
-               "M2S FIFO wait before serialization starts"),
+               "M2S FIFO wait before the first flit containing the packet"),
       ADD_STAT(s2mQueueWaitTicks, statistics::units::Tick::get(),
-               "S2M FIFO wait before serialization starts"),
+               "S2M FIFO wait before the first flit containing the packet"),
       ADD_STAT(m2sSerializationTicks, statistics::units::Tick::get(),
-               "M2S serialization delay"),
+               "M2S serialization time from first to last emitted flit"),
       ADD_STAT(s2mSerializationTicks, statistics::units::Tick::get(),
-               "S2M serialization delay"),
+               "S2M serialization time from first to last emitted flit"),
       ADD_STAT(m2sBaseLatencyTicks, statistics::units::Tick::get(),
                "M2S fixed base link latency"),
       ADD_STAT(s2mBaseLatencyTicks, statistics::units::Tick::get(),
@@ -85,9 +127,11 @@ CxlMemLink::CxlMemLink(const Params &p)
       ADD_STAT(s2mFullEvents, statistics::units::Count::get(),
                "Requests rejected because the S2M FIFO reservation was full")
 {
-    fatal_if(flitSizeBytes == 0, "CxlMemLink flit size must be non-zero");
-    fatal_if(requestHeaderFlits == 0 || responseHeaderFlits == 0,
-             "CxlMemLink header flit counts must be non-zero");
+    fatal_if(!use256BFlitPacker(),
+             "CxlMemLink real flit packer currently supports only 256B mode");
+    fatal_if(requestHeaderFlits != 1 || responseHeaderFlits != 1,
+             "CxlMemLink 256B packer expects one request header and one "
+             "response header flit parameter");
     fatal_if(m2sQueueDepthFlits == 0 || s2mQueueDepthFlits == 0,
              "CxlMemLink FIFO depths must be non-zero");
 
@@ -143,7 +187,7 @@ CxlMemLink::init()
 }
 
 bool
-CxlMemLink::use256BSlotModel() const
+CxlMemLink::use256BFlitPacker() const
 {
     return flitSizeBytes == 256;
 }
@@ -151,60 +195,7 @@ CxlMemLink::use256BSlotModel() const
 uint64_t
 CxlMemLink::serializationUnitBytes() const
 {
-    // In 256B flit mode, CXL.cachemem messages are packed into 16B slots.
-    // We model the current link at slot granularity so RwD/DRS data-bearing
-    // messages pay for the extra data slots instead of charging a full 256B
-    // unit per header. For non-256B modes, keep the older whole-flit model.
-    return use256BSlotModel() ? 16 : flitSizeBytes;
-}
-
-uint64_t
-CxlMemLink::dataUnits(PacketPtr pkt) const
-{
-    const uint64_t bytes = pkt->getSize();
-
-    if (use256BSlotModel()) {
-        const uint64_t slot_bytes = serializationUnitBytes();
-        return std::max<uint64_t>(1, (bytes + slot_bytes - 1) / slot_bytes);
-    }
-
-    return (bytes + flitSizeBytes - 1) / flitSizeBytes;
-}
-
-uint64_t
-CxlMemLink::m2sRequestFlits(PacketPtr pkt) const
-{
-    uint64_t flits = requestHeaderFlits;
-
-    if (pkt->isWrite()) {
-        flits += dataUnits(pkt);
-    }
-
-    return flits;
-}
-
-uint64_t
-CxlMemLink::s2mResponseFlitsForRequest(PacketPtr pkt) const
-{
-    uint64_t flits = responseHeaderFlits;
-
-    if (pkt->hasRespData()) {
-        flits += dataUnits(pkt);
-    }
-
-    return flits;
-}
-
-uint64_t
-CxlMemLink::s2mResponseFlits(PacketPtr pkt) const
-{
-    uint64_t flits = responseHeaderFlits;
-
-    if (pkt->hasData()) {
-        flits += dataUnits(pkt);
-    }
-
-    return flits;
+    return flitSizeBytes;
 }
 
 Tick
@@ -214,30 +205,465 @@ CxlMemLink::serializationDelay(uint64_t flits) const
         static_cast<double>(flits * serializationUnitBytes()) * bandwidth));
 }
 
-CxlMemLink::LinkSchedule
-CxlMemLink::scheduleM2S(Tick arrival, uint64_t flits)
+CxlMemLink::MessageClass
+CxlMemLink::m2sMessageClass(PacketPtr pkt) const
 {
-    LinkSchedule schedule;
-    const Tick start = std::max(arrival, nextM2SReady);
-    schedule.queueWait = start - arrival;
-    schedule.serialization = serializationDelay(flits);
-    schedule.baseLatency = m2sLatency;
-    nextM2SReady = start + schedule.serialization;
-    schedule.readyTick = nextM2SReady + schedule.baseLatency;
-    return schedule;
+    return pkt->isWrite() ? MessageClass::M2SRwD : MessageClass::M2SReq;
 }
 
-CxlMemLink::LinkSchedule
-CxlMemLink::scheduleS2M(Tick arrival, uint64_t flits)
+CxlMemLink::MessageClass
+CxlMemLink::s2mMessageClass(PacketPtr pkt) const
 {
+    return pkt->hasData() ? MessageClass::S2MDRS : MessageClass::S2MNDR;
+}
+
+uint64_t
+CxlMemLink::dataSlots(PacketPtr pkt) const
+{
+    const uint64_t bytes = pkt->getSize();
+    return std::max<uint64_t>(1, (bytes + 15) / 16);
+}
+
+uint64_t
+CxlMemLink::trailerSlots(MessageClass msg_class, PacketPtr pkt) const
+{
+    if (msg_class == MessageClass::M2SRwD && pkt->isMaskedWrite()) {
+        return 1;
+    }
+    return 0;
+}
+
+uint64_t
+CxlMemLink::reservedFlits(MessageClass msg_class, PacketPtr pkt) const
+{
+    if (!isDataBearing(msg_class)) {
+        return 1;
+    }
+
+    const uint64_t follow_slots =
+        dataSlots(pkt) + trailerSlots(msg_class, pkt);
+    if (follow_slots <= 14) {
+        return 1;
+    }
+
+    return 1 + ((follow_slots - 14) + 13) / 14;
+}
+
+uint64_t
+CxlMemLink::reservedS2MRespFlits(PacketPtr pkt) const
+{
+    return reservedFlits(
+        pkt->hasRespData() ? MessageClass::S2MDRS : MessageClass::S2MNDR, pkt);
+}
+
+Tick
+CxlMemLink::standaloneMessageDelay(MessageClass msg_class, PacketPtr pkt) const
+{
+    return serializationDelay(reservedFlits(msg_class, pkt));
+}
+
+CxlMemLink::DirectionState &
+CxlMemLink::directionState(LinkDirection direction)
+{
+    return direction == LinkDirection::M2S ? m2sState : s2mState;
+}
+
+const CxlMemLink::DirectionState &
+CxlMemLink::directionState(LinkDirection direction) const
+{
+    return direction == LinkDirection::M2S ? m2sState : s2mState;
+}
+
+void
+CxlMemLink::accountQueueOccupancy(DirectionState &state)
+{
+    if (state.direction == LinkDirection::M2S) {
+        accountM2SQueueOccupancy(state.queuedFlits);
+    } else {
+        accountS2MQueueOccupancy(state.queuedFlits);
+    }
+}
+
+bool
+CxlMemLink::queueCanFit(const DirectionState &state, uint64_t flits) const
+{
+    return state.queuedFlits + flits <= state.queueDepthFlits;
+}
+
+void
+CxlMemLink::enqueueMessage(DirectionState &state,
+                           const ProtocolMessagePtr &msg)
+{
+    accountQueueOccupancy(state);
+    state.queuedFlits += msg->reservedFlits;
+    state.pending.push_back(msg);
+    maybeScheduleFlit(state, msg->arrivalTick);
+}
+
+void
+CxlMemLink::dequeueMessage(DirectionState &state,
+                           const ProtocolMessagePtr &msg)
+{
+    accountQueueOccupancy(state);
+    panic_if(state.queuedFlits < msg->reservedFlits,
+             "CxlMemLink %s underflow in %s queued flits", name(),
+             state.direction == LinkDirection::M2S ? "M2S" : "S2M");
+    state.queuedFlits -= msg->reservedFlits;
+}
+
+void
+CxlMemLink::maybeScheduleFlit(DirectionState &state, Tick when)
+{
+    if (state.emitEvent.scheduled()) {
+        return;
+    }
+
+    if (state.pending.empty() && !state.activeDataMsg) {
+        return;
+    }
+
+    Tick schedule_tick = std::max(when, state.nextFlitTick);
+    if (!state.activeDataMsg && !state.pending.empty()) {
+        schedule_tick =
+            std::max(schedule_tick, state.pending.front()->arrivalTick);
+    }
+    schedule(state.emitEvent, std::max(schedule_tick, curTick()));
+}
+
+void
+CxlMemLink::touchMessageFlit(const ProtocolMessagePtr &msg, Tick flit_tick)
+{
+    if (msg->emittedFlits == 0 || msg->lastFlitTick != flit_tick) {
+        ++msg->emittedFlits;
+        msg->lastFlitTick = flit_tick;
+    }
+}
+
+void
+CxlMemLink::markHeaderSent(const ProtocolMessagePtr &msg, Tick flit_tick)
+{
+    touchMessageFlit(msg, flit_tick);
+    if (!msg->headerSent) {
+        msg->headerSent = true;
+        msg->serviceStartTick = flit_tick;
+    }
+}
+
+void
+CxlMemLink::consumeContinuationSlot(const ProtocolMessagePtr &msg,
+                                    Tick flit_tick)
+{
+    touchMessageFlit(msg, flit_tick);
+    if (msg->remainingDataSlots() != 0) {
+        ++msg->dataSlotsSent;
+    } else {
+        panic_if(msg->remainingTrailerSlots() == 0,
+                 "CxlMemLink %s consumed continuation slot after completion",
+                 name());
+        ++msg->trailerSlotsSent;
+    }
+}
+
+void
+CxlMemLink::completeMessage(DirectionState &state,
+                            const ProtocolMessagePtr &msg,
+                            Tick completion_tick)
+{
+    msg->completionTick = completion_tick;
+    dequeueMessage(state, msg);
+
     LinkSchedule schedule;
-    const Tick start = std::max(arrival, nextS2MReady);
-    schedule.queueWait = start - arrival;
-    schedule.serialization = serializationDelay(flits);
-    schedule.baseLatency = s2mLatency;
-    nextS2MReady = start + schedule.serialization;
-    schedule.readyTick = nextS2MReady + schedule.baseLatency;
-    return schedule;
+    schedule.queueWait = msg->serviceStartTick - msg->arrivalTick;
+    schedule.serialization = completion_tick - msg->serviceStartTick;
+    schedule.baseLatency = state.baseLatency;
+    schedule.readyTick = completion_tick + state.baseLatency;
+
+    if (state.direction == LinkDirection::M2S) {
+        recordM2SPacket(msg->emittedFlits, schedule);
+        memSidePort(msg->portId).schedTimingReq(msg->pkt, schedule.readyTick);
+    } else {
+        recordS2MPacket(msg->emittedFlits, schedule);
+        cpuSidePort(msg->portId).schedTimingResp(msg->pkt, schedule.readyTick);
+    }
+}
+
+int
+CxlMemLink::slotGroup(int slot) const
+{
+    return std::min(slot / 4, 3);
+}
+
+int
+CxlMemLink::groupCountIndex(MessageClass msg_class) const
+{
+    switch (msg_class) {
+        case MessageClass::M2SReq:
+        case MessageClass::S2MNDR:
+            return 0;
+        case MessageClass::M2SRwD:
+        case MessageClass::S2MDRS:
+            return 1;
+    }
+
+    panic("Unreachable CXL.mem message class");
+    return 0;
+}
+
+uint32_t
+CxlMemLink::maxGroupMessages(MessageClass msg_class) const
+{
+    switch (msg_class) {
+        case MessageClass::M2SReq:
+            return 4;
+        case MessageClass::M2SRwD:
+            return 2;
+        case MessageClass::S2MNDR:
+            return 6;
+        case MessageClass::S2MDRS:
+            return 3;
+    }
+
+    panic("Unreachable CXL.mem message class");
+    return 0;
+}
+
+bool
+CxlMemLink::isDataBearing(MessageClass msg_class) const
+{
+    return msg_class == MessageClass::M2SRwD ||
+           msg_class == MessageClass::S2MDRS;
+}
+
+bool
+CxlMemLink::isSlotLegal(MessageClass msg_class, bool header_slot) const
+{
+    switch (msg_class) {
+        case MessageClass::M2SReq:
+            return true;
+        case MessageClass::M2SRwD:
+        case MessageClass::S2MDRS:
+            return true;
+        case MessageClass::S2MNDR:
+            return true;
+    }
+
+    panic("Unreachable CXL.mem message class");
+    return false;
+}
+
+bool
+CxlMemLink::canStartDataHeader(const ProtocolMessagePtr &msg,
+                               bool header_slot) const
+{
+    if (!msg->dataBearing()) {
+        return false;
+    }
+
+    if (!header_slot) {
+        return true;
+    }
+
+    const uint64_t remaining =
+        msg->remainingDataSlots() + msg->remainingTrailerSlots();
+    return remaining <= 16;
+}
+
+bool
+CxlMemLink::canPackGroupMessage(const DirectionState &state,
+                                const FlitBuildState &flit,
+                                MessageClass msg_class, int slot,
+                                uint32_t count) const
+{
+    const int index = groupCountIndex(msg_class);
+    const int group = slotGroup(slot);
+    const uint32_t limit = maxGroupMessages(msg_class);
+    const uint32_t current = flit.groupCounts[index][group];
+
+    if (current + count > limit) {
+        return false;
+    }
+
+    if (group == 0) {
+        return state.prevTailCounts[index] + current + count <= limit;
+    }
+
+    return flit.groupCounts[index][group - 1] + current + count <= limit;
+}
+
+void
+CxlMemLink::recordGroupMessage(FlitBuildState &flit, MessageClass msg_class,
+                               int slot, uint32_t count)
+{
+    flit.groupCounts[groupCountIndex(msg_class)][slotGroup(slot)] += count;
+}
+
+uint32_t
+CxlMemLink::packNdrHeaders(DirectionState &state, FlitBuildState &flit,
+                           int slot, Tick flit_start, Tick flit_end)
+{
+    const bool header_slot = slot == 0;
+    const uint32_t slot_capacity = header_slot ? 2 : 3;
+    uint32_t packed = 0;
+
+    while (packed < slot_capacity && !state.pending.empty()) {
+        const auto &msg = state.pending.front();
+        if (msg->arrivalTick > flit_start ||
+            msg->msgClass != MessageClass::S2MNDR) {
+            break;
+        }
+        if (!canPackGroupMessage(state, flit, msg->msgClass, slot,
+                                 packed + 1)) {
+            break;
+        }
+
+        state.pending.pop_front();
+        markHeaderSent(msg, flit_start);
+        recordGroupMessage(flit, msg->msgClass, slot, 1);
+        completeMessage(state, msg, flit_end);
+        ++packed;
+    }
+
+    return packed;
+}
+
+bool
+CxlMemLink::startDataHeader(DirectionState &state, FlitBuildState &flit,
+                            int slot, Tick flit_start)
+{
+    if (state.pending.empty()) {
+        return false;
+    }
+
+    const auto &msg = state.pending.front();
+    const bool header_slot = slot == 0;
+    if (msg->arrivalTick > flit_start || !msg->dataBearing()) {
+        return false;
+    }
+    if (!canStartDataHeader(msg, header_slot)) {
+        panic("CxlMemLink %s cannot legally start %s in an H-slot with "
+              "%llu remaining follow-on slots",
+              name(),
+              msg->msgClass == MessageClass::M2SRwD ? "M2S RwD" : "S2M DRS",
+              static_cast<unsigned long long>(msg->remainingDataSlots() +
+                                              msg->remainingTrailerSlots()));
+    }
+    if (flit.startedDataHeader ||
+        !canPackGroupMessage(state, flit, msg->msgClass, slot, 1)) {
+        return false;
+    }
+
+    state.pending.pop_front();
+    markHeaderSent(msg, flit_start);
+    recordGroupMessage(flit, msg->msgClass, slot, 1);
+    flit.startedDataHeader = true;
+    state.activeDataMsg = msg;
+    return true;
+}
+
+bool
+CxlMemLink::packReqHeader(DirectionState &state, FlitBuildState &flit,
+                          int slot, Tick flit_start, Tick flit_end)
+{
+    if (state.pending.empty()) {
+        return false;
+    }
+
+    const auto &msg = state.pending.front();
+    if (msg->arrivalTick > flit_start ||
+        msg->msgClass != MessageClass::M2SReq ||
+        !canPackGroupMessage(state, flit, msg->msgClass, slot, 1)) {
+        return false;
+    }
+
+    state.pending.pop_front();
+    markHeaderSent(msg, flit_start);
+    recordGroupMessage(flit, msg->msgClass, slot, 1);
+    completeMessage(state, msg, flit_end);
+    return true;
+}
+
+bool
+CxlMemLink::packHeaderSlot(DirectionState &state, FlitBuildState &flit,
+                           int slot, Tick flit_start, Tick flit_end)
+{
+    if (state.pending.empty()) {
+        return false;
+    }
+
+    const auto &msg = state.pending.front();
+    if (msg->arrivalTick > flit_start) {
+        return false;
+    }
+
+    switch (msg->msgClass) {
+        case MessageClass::M2SReq:
+            return packReqHeader(state, flit, slot, flit_start, flit_end);
+        case MessageClass::S2MNDR:
+            return packNdrHeaders(state, flit, slot, flit_start, flit_end) !=
+                   0;
+        case MessageClass::M2SRwD:
+        case MessageClass::S2MDRS:
+            return startDataHeader(state, flit, slot, flit_start);
+    }
+
+    panic("Unreachable CXL.mem message class");
+    return false;
+}
+
+void
+CxlMemLink::processDirectionFlit(DirectionState &state)
+{
+    if (state.pending.empty() && !state.activeDataMsg) {
+        return;
+    }
+
+    const Tick flit_start = std::max(curTick(), state.nextFlitTick);
+    const Tick flit_end = flit_start + serializationDelay(1);
+    FlitBuildState flit;
+    bool emitted_payload = false;
+
+    for (int slot = 0; slot < 15; ++slot) {
+        if (slot == 0 && state.activeDataMsg) {
+            continue;
+        }
+
+        if (slot > 0 && state.activeDataMsg) {
+            consumeContinuationSlot(state.activeDataMsg, flit_start);
+            emitted_payload = true;
+            if (state.activeDataMsg->complete()) {
+                const auto completed = state.activeDataMsg;
+                state.activeDataMsg.reset();
+                completeMessage(state, completed, flit_end);
+            }
+            continue;
+        }
+
+        if (packHeaderSlot(state, flit, slot, flit_start, flit_end)) {
+            emitted_payload = true;
+        }
+    }
+
+    panic_if(!emitted_payload,
+             "CxlMemLink %s emitted an empty protocol flit while work was "
+             "pending",
+             name());
+
+    if (state.direction == LinkDirection::M2S) {
+        ++m2sFlits;
+    } else {
+        ++s2mFlits;
+    }
+
+    state.nextFlitTick = flit_end;
+    for (int i = 0; i < 2; ++i) {
+        state.prevTailCounts[i] = flit.groupCounts[i][3];
+    }
+
+    if (!state.pending.empty() || state.activeDataMsg) {
+        maybeScheduleFlit(state, flit_end);
+    }
+
+    retryStalledReqs();
 }
 
 void
@@ -259,8 +685,8 @@ CxlMemLink::accountS2MQueueOccupancy(uint64_t queued_flits)
 void
 CxlMemLink::recordM2SPacket(uint64_t flits, const LinkSchedule &schedule)
 {
+    [[maybe_unused]] const uint64_t emitted_flits = flits;
     ++m2sPackets;
-    m2sFlits += flits;
     m2sQueueWaitTicks += schedule.queueWait;
     m2sSerializationTicks += schedule.serialization;
     m2sBaseLatencyTicks += schedule.baseLatency;
@@ -271,8 +697,8 @@ CxlMemLink::recordM2SPacket(uint64_t flits, const LinkSchedule &schedule)
 void
 CxlMemLink::recordS2MPacket(uint64_t flits, const LinkSchedule &schedule)
 {
+    [[maybe_unused]] const uint64_t emitted_flits = flits;
     ++s2mPackets;
-    s2mFlits += flits;
     s2mQueueWaitTicks += schedule.queueWait;
     s2mSerializationTicks += schedule.serialization;
     s2mBaseLatencyTicks += schedule.baseLatency;
@@ -292,22 +718,10 @@ CxlMemLink::recordS2MStall()
     ++s2mFullEvents;
 }
 
-bool
-CxlMemLink::m2sQueueCanFit(uint64_t flits) const
-{
-    return queuedM2SFlits + flits <= m2sQueueDepthFlits;
-}
-
-bool
-CxlMemLink::s2mQueueCanFit(uint64_t flits) const
-{
-    return queuedS2MFlits + reservedS2MFlits + flits <= s2mQueueDepthFlits;
-}
-
 void
 CxlMemLink::reserveS2MResp(uint64_t flits)
 {
-    accountS2MQueueOccupancy(queuedS2MFlits);
+    accountS2MQueueOccupancy(s2mState.queuedFlits);
     reservedS2MFlits += flits;
 }
 
@@ -317,38 +731,9 @@ CxlMemLink::consumeS2MRespReservation(uint64_t flits)
     panic_if(reservedS2MFlits < flits,
              "CxlMemLink %s received a %llu-flit response with only "
              "%llu reserved S2M flits\n",
-             name(), flits, reservedS2MFlits);
+             name(), static_cast<unsigned long long>(flits),
+             static_cast<unsigned long long>(reservedS2MFlits));
     reservedS2MFlits -= flits;
-}
-
-void
-CxlMemLink::enqueueM2S(uint64_t flits)
-{
-    accountM2SQueueOccupancy(queuedM2SFlits);
-    queuedM2SFlits += flits;
-}
-
-void
-CxlMemLink::dequeueM2S(uint64_t flits)
-{
-    accountM2SQueueOccupancy(queuedM2SFlits);
-    assert(queuedM2SFlits >= flits);
-    queuedM2SFlits -= flits;
-}
-
-void
-CxlMemLink::enqueueS2M(uint64_t flits)
-{
-    accountS2MQueueOccupancy(queuedS2MFlits);
-    queuedS2MFlits += flits;
-}
-
-void
-CxlMemLink::dequeueS2M(uint64_t flits)
-{
-    accountS2MQueueOccupancy(queuedS2MFlits);
-    assert(queuedS2MFlits >= flits);
-    queuedS2MFlits -= flits;
 }
 
 void
@@ -403,65 +788,69 @@ CxlMemLink::CxlResponsePort::recvTimingReq(PacketPtr pkt)
         return false;
     }
 
-    const uint64_t req_flits = link.m2sRequestFlits(pkt);
+    const auto msg_class = link.m2sMessageClass(pkt);
+    const uint64_t req_flits = link.reservedFlits(msg_class, pkt);
     const bool expects_response = pkt->needsResponse();
     const uint64_t resp_flits =
-        expects_response ? link.s2mResponseFlitsForRequest(pkt) : 0;
+        expects_response ? link.reservedS2MRespFlits(pkt) : 0;
 
     panic_if(req_flits > link.m2sQueueDepthFlits,
              "CxlMemLink %s M2S packet requires %llu flits but FIFO depth "
              "is only %llu flits\n",
-             link.name(), req_flits, link.m2sQueueDepthFlits);
+             link.name(), static_cast<unsigned long long>(req_flits),
+             static_cast<unsigned long long>(link.m2sQueueDepthFlits));
     panic_if(resp_flits > link.s2mQueueDepthFlits,
              "CxlMemLink %s S2M response requires %llu flits but FIFO depth "
              "is only %llu flits\n",
-             link.name(), resp_flits, link.s2mQueueDepthFlits);
+             link.name(), static_cast<unsigned long long>(resp_flits),
+             static_cast<unsigned long long>(link.s2mQueueDepthFlits));
 
-    if (!link.m2sQueueCanFit(req_flits)) {
+    if (!link.queueCanFit(link.m2sState, req_flits)) {
         link.recordM2SStall();
         retryReq = true;
-    } else if (expects_response && !link.s2mQueueCanFit(resp_flits)) {
+        return false;
+    }
+    if (expects_response &&
+        link.s2mState.queuedFlits + link.reservedS2MFlits + resp_flits >
+            link.s2mQueueDepthFlits) {
         link.recordS2MStall();
         retryReq = true;
-    } else {
-        if (expects_response) {
-            link.reserveS2MResp(resp_flits);
-        }
-
-        const Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
-        pkt->headerDelay = pkt->payloadDelay = 0;
-        const auto schedule =
-            link.scheduleM2S(curTick() + receive_delay, req_flits);
-        link.recordM2SPacket(req_flits, schedule);
-        link.memSidePort(portId).schedTimingReq(pkt, schedule.readyTick,
-                                                req_flits);
+        return false;
     }
 
-    return !retryReq;
+    if (expects_response) {
+        link.reserveS2MResp(resp_flits);
+    }
+
+    const Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
+    pkt->headerDelay = pkt->payloadDelay = 0;
+    const Tick arrival_tick = curTick() + receive_delay;
+    auto msg = std::make_shared<ProtocolMessage>(
+        msg_class, pkt, portId, arrival_tick,
+        link.isDataBearing(msg_class) ? link.dataSlots(pkt) : 0,
+        link.trailerSlots(msg_class, pkt), req_flits);
+    link.enqueueMessage(link.m2sState, msg);
+    return true;
 }
 
 void
-CxlMemLink::CxlRequestPort::schedTimingReq(PacketPtr pkt, Tick when,
-                                           uint64_t flits)
+CxlMemLink::CxlRequestPort::schedTimingReq(PacketPtr pkt, Tick when)
 {
     if (transmitList.empty()) {
         link.schedule(sendEvent, when);
     }
 
-    link.enqueueM2S(flits);
-    transmitList.emplace_back(pkt, when, flits);
+    transmitList.emplace_back(pkt, when);
 }
 
 void
-CxlMemLink::CxlResponsePort::schedTimingResp(PacketPtr pkt, Tick when,
-                                             uint64_t flits)
+CxlMemLink::CxlResponsePort::schedTimingResp(PacketPtr pkt, Tick when)
 {
     if (transmitList.empty()) {
         link.schedule(sendEvent, when);
     }
 
-    link.enqueueS2M(flits);
-    transmitList.emplace_back(pkt, when, flits);
+    transmitList.emplace_back(pkt, when);
 }
 
 void
@@ -474,7 +863,6 @@ CxlMemLink::CxlRequestPort::trySendTiming()
 
     if (sendTimingReq(req.pkt)) {
         transmitList.pop_front();
-        link.dequeueM2S(req.flits);
 
         if (!transmitList.empty()) {
             const DeferredPacket next_req = transmitList.front();
@@ -495,7 +883,6 @@ CxlMemLink::CxlResponsePort::trySendTiming()
 
     if (sendTimingResp(resp.pkt)) {
         transmitList.pop_front();
-        link.dequeueS2M(resp.flits);
 
         if (!transmitList.empty()) {
             const DeferredPacket next_resp = transmitList.front();
@@ -512,20 +899,28 @@ CxlMemLink::CxlRequestPort::recvTimingResp(PacketPtr pkt)
     DPRINTF(CxlMemLink, "recvTimingResp[%d]: %s addr %#x size %u\n", portId,
             pkt->cmdString(), pkt->getAddr(), pkt->getSize());
 
-    const uint64_t flits = link.s2mResponseFlits(pkt);
+    const auto msg_class = link.s2mMessageClass(pkt);
+    const uint64_t flits = link.reservedFlits(msg_class, pkt);
     panic_if(flits > link.s2mQueueDepthFlits,
              "CxlMemLink %s response requires %llu flits but FIFO depth is "
              "only %llu flits\n",
-             link.name(), flits, link.s2mQueueDepthFlits);
+             link.name(), static_cast<unsigned long long>(flits),
+             static_cast<unsigned long long>(link.s2mQueueDepthFlits));
 
     link.consumeS2MRespReservation(flits);
+    panic_if(!link.queueCanFit(link.s2mState, flits),
+             "CxlMemLink %s S2M response exceeded actual queue capacity after "
+             "reservation",
+             link.name());
 
     const Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
     pkt->headerDelay = pkt->payloadDelay = 0;
-    const auto schedule = link.scheduleS2M(curTick() + receive_delay, flits);
-    link.recordS2MPacket(flits, schedule);
-    link.cpuSidePort(portId).schedTimingResp(pkt, schedule.readyTick, flits);
-
+    const Tick arrival_tick = curTick() + receive_delay;
+    auto msg = std::make_shared<ProtocolMessage>(
+        msg_class, pkt, portId, arrival_tick,
+        link.isDataBearing(msg_class) ? link.dataSlots(pkt) : 0,
+        link.trailerSlots(msg_class, pkt), flits);
+    link.enqueueMessage(link.s2mState, msg);
     return true;
 }
 
@@ -547,13 +942,13 @@ CxlMemLink::CxlResponsePort::recvAtomic(PacketPtr pkt)
     panic_if(pkt->cacheResponding(), "CxlMemLink should not see packets "
                                      "where a cache is already responding");
 
-    Tick latency =
-        link.m2sLatency + link.serializationDelay(link.m2sRequestFlits(pkt));
+    Tick latency = link.m2sLatency +
+                   link.standaloneMessageDelay(link.m2sMessageClass(pkt), pkt);
     const bool expects_response = pkt->needsResponse();
     latency += link.memSidePort(portId).sendAtomic(pkt);
     if (expects_response) {
         latency += link.s2mLatency +
-                   link.serializationDelay(link.s2mResponseFlits(pkt));
+                   link.standaloneMessageDelay(link.s2mMessageClass(pkt), pkt);
     }
     return latency;
 }
@@ -562,13 +957,13 @@ Tick
 CxlMemLink::CxlResponsePort::recvAtomicBackdoor(PacketPtr pkt,
                                                 MemBackdoorPtr &backdoor)
 {
-    Tick latency =
-        link.m2sLatency + link.serializationDelay(link.m2sRequestFlits(pkt));
+    Tick latency = link.m2sLatency +
+                   link.standaloneMessageDelay(link.m2sMessageClass(pkt), pkt);
     const bool expects_response = pkt->needsResponse();
     latency += link.memSidePort(portId).sendAtomicBackdoor(pkt, backdoor);
     if (expects_response) {
         latency += link.s2mLatency +
-                   link.serializationDelay(link.s2mResponseFlits(pkt));
+                   link.standaloneMessageDelay(link.s2mMessageClass(pkt), pkt);
     }
     return latency;
 }

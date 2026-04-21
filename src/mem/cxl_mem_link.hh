@@ -6,13 +6,16 @@
 #ifndef __MEM_CXL_MEM_LINK_HH__
 #define __MEM_CXL_MEM_LINK_HH__
 
+#include <array>
 #include <deque>
+#include <memory>
 #include <vector>
 
 #include "base/types.hh"
 #include "mem/port.hh"
 #include "params/CxlMemLink.hh"
 #include "sim/clocked_object.hh"
+#include "sim/eventq.hh"
 #include "sim/stats.hh"
 
 namespace gem5
@@ -24,9 +27,15 @@ namespace gem5
  * The object is a shared timing bottleneck with matched vectors of CPU-side
  * ingress ports and memory-side egress ports. It does not enumerate a CXL
  * device or model CXL.io; it only adds flit-based FIFO and serialization
- * delay between the host/Ruby side and backing memory controllers. Optional
- * base-link latency parameters are retained for calibration experiments, but
- * project configs default them to zero.
+ * delay between the host/Ruby side and backing memory controllers.
+ *
+ * The current implementation intentionally covers only a narrow first-pass
+ * 256B flit subset for the memory-only NUMA path:
+ * - direct-attached Type 3-style M2S/S2M traffic only
+ * - explicit internal message types for Req/RwD/NDR/DRS
+ * - one active data-header start per emitted flit
+ * - rollover of data-bearing messages across flits
+ * - no BISnp/BIRsp, LOpt 256B halves, CRC/FEC, or replay correctness model
  */
 class CxlMemLink : public ClockedObject
 {
@@ -36,11 +45,8 @@ class CxlMemLink : public ClockedObject
       public:
         const Tick tick;
         const PacketPtr pkt;
-        const uint64_t flits;
 
-        DeferredPacket(PacketPtr _pkt, Tick _tick, uint64_t _flits)
-            : tick(_tick), pkt(_pkt), flits(_flits)
-        {}
+        DeferredPacket(PacketPtr _pkt, Tick _tick) : tick(_tick), pkt(_pkt) {}
     };
 
     struct LinkSchedule
@@ -49,6 +55,91 @@ class CxlMemLink : public ClockedObject
         Tick queueWait = 0;
         Tick serialization = 0;
         Tick baseLatency = 0;
+    };
+
+    enum class MessageClass : uint8_t
+    {
+        M2SReq,
+        M2SRwD,
+        S2MNDR,
+        S2MDRS,
+    };
+
+    enum class LinkDirection : uint8_t
+    {
+        M2S,
+        S2M,
+    };
+
+    struct ProtocolMessage
+    {
+        const MessageClass msgClass;
+        const PacketPtr pkt;
+        const PortID portId;
+        const Tick arrivalTick;
+        const uint64_t dataSlotsTotal;
+        const uint64_t trailerSlotsTotal;
+        const uint64_t reservedFlits;
+
+        bool headerSent = false;
+        uint64_t dataSlotsSent = 0;
+        uint64_t trailerSlotsSent = 0;
+        uint64_t emittedFlits = 0;
+        Tick serviceStartTick = 0;
+        Tick completionTick = 0;
+        Tick lastFlitTick = 0;
+
+        ProtocolMessage(MessageClass _msg_class, PacketPtr _pkt,
+                        PortID _port_id, Tick _arrival_tick,
+                        uint64_t _data_slots_total,
+                        uint64_t _trailer_slots_total,
+                        uint64_t _reserved_flits)
+            : msgClass(_msg_class),
+              pkt(_pkt),
+              portId(_port_id),
+              arrivalTick(_arrival_tick),
+              dataSlotsTotal(_data_slots_total),
+              trailerSlotsTotal(_trailer_slots_total),
+              reservedFlits(_reserved_flits)
+        {}
+
+        bool dataBearing() const;
+        uint64_t remainingDataSlots() const;
+        uint64_t remainingTrailerSlots() const;
+        bool complete() const;
+    };
+
+    using ProtocolMessagePtr = std::shared_ptr<ProtocolMessage>;
+
+    struct DirectionState
+    {
+        LinkDirection direction;
+        Tick baseLatency = 0;
+        uint64_t queueDepthFlits = 0;
+        Tick nextFlitTick = 0;
+        Tick lastQueueUpdate = 0;
+        uint64_t queuedFlits = 0;
+        std::array<uint32_t, 2> prevTailCounts = {0, 0};
+        std::deque<ProtocolMessagePtr> pending;
+        ProtocolMessagePtr activeDataMsg;
+        EventFunctionWrapper emitEvent;
+
+        DirectionState(CxlMemLink &link, LinkDirection _direction,
+                       Tick _base_latency, uint64_t _queue_depth,
+                       const std::string &event_name);
+        DirectionState(DirectionState &&) = default;
+        DirectionState &operator=(DirectionState &&) = default;
+        DirectionState(const DirectionState &) = delete;
+        DirectionState &operator=(const DirectionState &) = delete;
+    };
+
+    struct FlitBuildState
+    {
+        std::array<std::array<uint32_t, 4>, 2> groupCounts = {{
+            {0, 0, 0, 0},
+            {0, 0, 0, 0},
+        }};
+        bool startedDataHeader = false;
     };
 
     class CxlRequestPort;
@@ -64,7 +155,7 @@ class CxlMemLink : public ClockedObject
         bool retryReq;
         EventFunctionWrapper sendEvent;
 
-        void schedTimingResp(PacketPtr pkt, Tick when, uint64_t flits);
+        void schedTimingResp(PacketPtr pkt, Tick when);
         void trySendTiming();
 
       public:
@@ -95,7 +186,7 @@ class CxlMemLink : public ClockedObject
         std::deque<DeferredPacket> transmitList;
         EventFunctionWrapper sendEvent;
 
-        void schedTimingReq(PacketPtr pkt, Tick when, uint64_t flits);
+        void schedTimingReq(PacketPtr pkt, Tick when);
         bool trySatisfyFunctional(PacketPtr pkt);
         void trySendTiming();
 
@@ -125,23 +216,60 @@ class CxlMemLink : public ClockedObject
     const uint64_t m2sQueueDepthFlits;
     const uint64_t s2mQueueDepthFlits;
 
-    Tick nextM2SReady;
-    Tick nextS2MReady;
+    DirectionState m2sState;
+    DirectionState s2mState;
     Tick lastM2SQueueUpdate;
     Tick lastS2MQueueUpdate;
-    uint64_t queuedM2SFlits;
-    uint64_t queuedS2MFlits;
     uint64_t reservedS2MFlits;
 
-    bool use256BSlotModel() const;
+    bool use256BFlitPacker() const;
     uint64_t serializationUnitBytes() const;
-    uint64_t dataUnits(PacketPtr pkt) const;
-    uint64_t m2sRequestFlits(PacketPtr pkt) const;
-    uint64_t s2mResponseFlitsForRequest(PacketPtr pkt) const;
-    uint64_t s2mResponseFlits(PacketPtr pkt) const;
     Tick serializationDelay(uint64_t flits) const;
-    LinkSchedule scheduleM2S(Tick arrival, uint64_t flits);
-    LinkSchedule scheduleS2M(Tick arrival, uint64_t flits);
+
+    MessageClass m2sMessageClass(PacketPtr pkt) const;
+    MessageClass s2mMessageClass(PacketPtr pkt) const;
+    uint64_t dataSlots(PacketPtr pkt) const;
+    uint64_t trailerSlots(MessageClass msg_class, PacketPtr pkt) const;
+    uint64_t reservedFlits(MessageClass msg_class, PacketPtr pkt) const;
+    uint64_t reservedS2MRespFlits(PacketPtr pkt) const;
+    Tick standaloneMessageDelay(MessageClass msg_class, PacketPtr pkt) const;
+
+    DirectionState &directionState(LinkDirection direction);
+    const DirectionState &directionState(LinkDirection direction) const;
+    void accountQueueOccupancy(DirectionState &state);
+    bool queueCanFit(const DirectionState &state, uint64_t flits) const;
+    void enqueueMessage(DirectionState &state, const ProtocolMessagePtr &msg);
+    void dequeueMessage(DirectionState &state, const ProtocolMessagePtr &msg);
+    void maybeScheduleFlit(DirectionState &state, Tick when);
+    void processDirectionFlit(DirectionState &state);
+    void touchMessageFlit(const ProtocolMessagePtr &msg, Tick flit_tick);
+    void markHeaderSent(const ProtocolMessagePtr &msg, Tick flit_tick);
+    void consumeContinuationSlot(const ProtocolMessagePtr &msg,
+                                 Tick flit_tick);
+    void completeMessage(DirectionState &state, const ProtocolMessagePtr &msg,
+                         Tick completion_tick);
+
+    int slotGroup(int slot) const;
+    int groupCountIndex(MessageClass msg_class) const;
+    uint32_t maxGroupMessages(MessageClass msg_class) const;
+    bool isDataBearing(MessageClass msg_class) const;
+    bool isSlotLegal(MessageClass msg_class, bool header_slot) const;
+    bool canStartDataHeader(const ProtocolMessagePtr &msg,
+                            bool header_slot) const;
+    bool canPackGroupMessage(const DirectionState &state,
+                             const FlitBuildState &flit,
+                             MessageClass msg_class, int slot,
+                             uint32_t count) const;
+    void recordGroupMessage(FlitBuildState &flit, MessageClass msg_class,
+                            int slot, uint32_t count);
+    uint32_t packNdrHeaders(DirectionState &state, FlitBuildState &flit,
+                            int slot, Tick flit_start, Tick flit_end);
+    bool startDataHeader(DirectionState &state, FlitBuildState &flit, int slot,
+                         Tick flit_start);
+    bool packReqHeader(DirectionState &state, FlitBuildState &flit, int slot,
+                       Tick flit_start, Tick flit_end);
+    bool packHeaderSlot(DirectionState &state, FlitBuildState &flit, int slot,
+                        Tick flit_start, Tick flit_end);
 
     void accountM2SQueueOccupancy(uint64_t queued_flits);
     void accountS2MQueueOccupancy(uint64_t queued_flits);
@@ -149,14 +277,8 @@ class CxlMemLink : public ClockedObject
     void recordS2MPacket(uint64_t flits, const LinkSchedule &schedule);
     void recordM2SStall();
     void recordS2MStall();
-    bool m2sQueueCanFit(uint64_t flits) const;
-    bool s2mQueueCanFit(uint64_t flits) const;
     void reserveS2MResp(uint64_t flits);
     void consumeS2MRespReservation(uint64_t flits);
-    void enqueueM2S(uint64_t flits);
-    void dequeueM2S(uint64_t flits);
-    void enqueueS2M(uint64_t flits);
-    void dequeueS2M(uint64_t flits);
     void retryStalledReqs();
     CxlRequestPort &memSidePort(PortID port_id);
     const CxlRequestPort &memSidePort(PortID port_id) const;

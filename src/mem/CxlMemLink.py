@@ -25,8 +25,8 @@ class CxlMemLink(ClockedObject):
 
     flit_size_bytes = Param.Unsigned(
         256,
-        "CXL.cachemem link mode to model, usually 68 or 256 bytes; in 256B "
-        "mode the implementation serializes payload at 16B slot granularity",
+        "CXL.cachemem flit size to model; the current real packer supports "
+        "256B mode only",
     )
     bandwidth = Param.MemoryBandwidth(
         "64GiB/s", "Per-direction CXL.mem serialization bandwidth"
@@ -40,17 +40,17 @@ class CxlMemLink(ClockedObject):
 
     request_header_flits = Param.Unsigned(
         1,
-        "Simplified M2S CXL.mem header cost in serialized units; in 256B "
-        "mode one unit corresponds to one 16B slot",
+        "Legacy compatibility knob; the current 256B packer expects this to "
+        "remain 1",
     )
     response_header_flits = Param.Unsigned(
         1,
-        "Simplified S2M CXL.mem header cost in serialized units; in 256B "
-        "mode one unit corresponds to one 16B slot",
+        "Legacy compatibility knob; the current 256B packer expects this to "
+        "remain 1",
     )
     m2s_queue_depth_flits = Param.Unsigned(
-        256, "Host-to-device FIFO capacity in CXL flits"
+        256, "Host-to-device FIFO capacity in emitted 256B CXL flits"
     )
     s2m_queue_depth_flits = Param.Unsigned(
-        256, "Device-to-host FIFO capacity in CXL flits"
+        256, "Device-to-host FIFO capacity in emitted 256B CXL flits"
     )
