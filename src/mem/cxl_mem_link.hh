@@ -109,7 +109,7 @@ class CxlMemLink : public ClockedObject
         bool complete() const;
     };
 
-    using ProtocolMessagePtr = std::shared_ptr<ProtocolMessage>;
+    using ProtocolMessagePtr = std::unique_ptr<ProtocolMessage>;
 
     struct DirectionState
     {
@@ -225,6 +225,9 @@ class CxlMemLink : public ClockedObject
     bool use256BFlitPacker() const;
     uint64_t serializationUnitBytes() const;
     Tick serializationDelay(uint64_t flits) const;
+    const char *messageClassName(MessageClass msg_class) const;
+    const char *directionName(LinkDirection direction) const;
+    Addr debugPacketAddr(PacketPtr pkt) const;
 
     MessageClass m2sMessageClass(PacketPtr pkt) const;
     MessageClass s2mMessageClass(PacketPtr pkt) const;
@@ -238,15 +241,14 @@ class CxlMemLink : public ClockedObject
     const DirectionState &directionState(LinkDirection direction) const;
     void accountQueueOccupancy(DirectionState &state);
     bool queueCanFit(const DirectionState &state, uint64_t flits) const;
-    void enqueueMessage(DirectionState &state, const ProtocolMessagePtr &msg);
-    void dequeueMessage(DirectionState &state, const ProtocolMessagePtr &msg);
+    void enqueueMessage(DirectionState &state, ProtocolMessagePtr msg);
+    void dequeueMessage(DirectionState &state, const ProtocolMessage &msg);
     void maybeScheduleFlit(DirectionState &state, Tick when);
     void processDirectionFlit(DirectionState &state);
-    void touchMessageFlit(const ProtocolMessagePtr &msg, Tick flit_tick);
-    void markHeaderSent(const ProtocolMessagePtr &msg, Tick flit_tick);
-    void consumeContinuationSlot(const ProtocolMessagePtr &msg,
-                                 Tick flit_tick);
-    void completeMessage(DirectionState &state, const ProtocolMessagePtr &msg,
+    void touchMessageFlit(ProtocolMessage &msg, Tick flit_tick);
+    void markHeaderSent(ProtocolMessage &msg, Tick flit_tick);
+    void consumeContinuationSlot(ProtocolMessage &msg, Tick flit_tick);
+    void completeMessage(DirectionState &state, ProtocolMessagePtr msg,
                          Tick completion_tick);
 
     int slotGroup(int slot) const;
@@ -254,7 +256,7 @@ class CxlMemLink : public ClockedObject
     uint32_t maxGroupMessages(MessageClass msg_class) const;
     bool isDataBearing(MessageClass msg_class) const;
     bool isSlotLegal(MessageClass msg_class, bool header_slot) const;
-    bool canStartDataHeader(const ProtocolMessagePtr &msg,
+    bool canStartDataHeader(const ProtocolMessage &msg,
                             bool header_slot) const;
     bool canPackGroupMessage(const DirectionState &state,
                              const FlitBuildState &flit,

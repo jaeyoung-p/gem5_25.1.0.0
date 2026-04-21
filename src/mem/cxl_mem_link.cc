@@ -149,6 +149,9 @@ CxlMemLink::CxlMemLink(const Params &p)
              "%zu ranges for %d ports",
              portRanges.size(), cpu_port_count);
 
+    memSidePorts.reserve(mem_port_count);
+    cpuSidePorts.reserve(cpu_port_count);
+
     for (PortID i = 0; i < mem_port_count; ++i) {
         memSidePorts.emplace_back(csprintf("%s.mem_side_ports[%d]", name(), i),
                                   *this, i);
@@ -203,6 +206,45 @@ CxlMemLink::serializationDelay(uint64_t flits) const
 {
     return static_cast<Tick>(std::ceil(
         static_cast<double>(flits * serializationUnitBytes()) * bandwidth));
+}
+
+const char *
+CxlMemLink::messageClassName(MessageClass msg_class) const
+{
+    switch (msg_class) {
+        case MessageClass::M2SReq:
+            return "M2S Req";
+        case MessageClass::M2SRwD:
+            return "M2S RwD";
+        case MessageClass::S2MNDR:
+            return "S2M NDR";
+        case MessageClass::S2MDRS:
+            return "S2M DRS";
+    }
+
+    panic("Unreachable CXL.mem message class");
+    return "unknown";
+}
+
+const char *
+CxlMemLink::directionName(LinkDirection direction) const
+{
+    switch (direction) {
+        case LinkDirection::M2S:
+            return "M2S";
+        case LinkDirection::S2M:
+            return "S2M";
+    }
+
+    panic("Unreachable CXL.mem link direction");
+    return "unknown";
+}
+
+Addr
+CxlMemLink::debugPacketAddr(PacketPtr pkt) const
+{
+    return (pkt && pkt->req && pkt->req->hasPaddr()) ? pkt->req->getPaddr()
+                                                     : 0;
 }
 
 CxlMemLink::MessageClass
@@ -291,24 +333,33 @@ CxlMemLink::queueCanFit(const DirectionState &state, uint64_t flits) const
 }
 
 void
-CxlMemLink::enqueueMessage(DirectionState &state,
-                           const ProtocolMessagePtr &msg)
+CxlMemLink::enqueueMessage(DirectionState &state, ProtocolMessagePtr msg)
 {
     accountQueueOccupancy(state);
+    DPRINTF(CxlMemLink,
+            "enqueue %s %s addr %#x port %d arrival %llu flits %llu "
+            "queued_before %llu active %d pending %llu\n",
+            directionName(state.direction), messageClassName(msg->msgClass),
+            debugPacketAddr(msg->pkt), msg->portId,
+            static_cast<unsigned long long>(msg->arrivalTick),
+            static_cast<unsigned long long>(msg->reservedFlits),
+            static_cast<unsigned long long>(state.queuedFlits),
+            state.activeDataMsg ? 1 : 0,
+            static_cast<unsigned long long>(state.pending.size()));
     state.queuedFlits += msg->reservedFlits;
-    state.pending.push_back(msg);
-    maybeScheduleFlit(state, msg->arrivalTick);
+    const Tick arrival_tick = msg->arrivalTick;
+    state.pending.push_back(std::move(msg));
+    maybeScheduleFlit(state, arrival_tick);
 }
 
 void
-CxlMemLink::dequeueMessage(DirectionState &state,
-                           const ProtocolMessagePtr &msg)
+CxlMemLink::dequeueMessage(DirectionState &state, const ProtocolMessage &msg)
 {
     accountQueueOccupancy(state);
-    panic_if(state.queuedFlits < msg->reservedFlits,
+    panic_if(state.queuedFlits < msg.reservedFlits,
              "CxlMemLink %s underflow in %s queued flits", name(),
              state.direction == LinkDirection::M2S ? "M2S" : "S2M");
-    state.queuedFlits -= msg->reservedFlits;
+    state.queuedFlits -= msg.reservedFlits;
 }
 
 void
@@ -327,50 +378,71 @@ CxlMemLink::maybeScheduleFlit(DirectionState &state, Tick when)
         schedule_tick =
             std::max(schedule_tick, state.pending.front()->arrivalTick);
     }
+    DPRINTF(
+        CxlMemLink,
+        "schedule %s flit at %llu next %llu pending %llu active %d "
+        "queued %llu\n",
+        directionName(state.direction),
+        static_cast<unsigned long long>(std::max(schedule_tick, curTick())),
+        static_cast<unsigned long long>(state.nextFlitTick),
+        static_cast<unsigned long long>(state.pending.size()),
+        state.activeDataMsg ? 1 : 0,
+        static_cast<unsigned long long>(state.queuedFlits));
     schedule(state.emitEvent, std::max(schedule_tick, curTick()));
 }
 
 void
-CxlMemLink::touchMessageFlit(const ProtocolMessagePtr &msg, Tick flit_tick)
+CxlMemLink::touchMessageFlit(ProtocolMessage &msg, Tick flit_tick)
 {
-    if (msg->emittedFlits == 0 || msg->lastFlitTick != flit_tick) {
-        ++msg->emittedFlits;
-        msg->lastFlitTick = flit_tick;
+    if (msg.emittedFlits == 0 || msg.lastFlitTick != flit_tick) {
+        ++msg.emittedFlits;
+        msg.lastFlitTick = flit_tick;
     }
 }
 
 void
-CxlMemLink::markHeaderSent(const ProtocolMessagePtr &msg, Tick flit_tick)
+CxlMemLink::markHeaderSent(ProtocolMessage &msg, Tick flit_tick)
 {
     touchMessageFlit(msg, flit_tick);
-    if (!msg->headerSent) {
-        msg->headerSent = true;
-        msg->serviceStartTick = flit_tick;
+    if (!msg.headerSent) {
+        msg.headerSent = true;
+        msg.serviceStartTick = flit_tick;
     }
 }
 
 void
-CxlMemLink::consumeContinuationSlot(const ProtocolMessagePtr &msg,
-                                    Tick flit_tick)
+CxlMemLink::consumeContinuationSlot(ProtocolMessage &msg, Tick flit_tick)
 {
     touchMessageFlit(msg, flit_tick);
-    if (msg->remainingDataSlots() != 0) {
-        ++msg->dataSlotsSent;
+    if (msg.remainingDataSlots() != 0) {
+        ++msg.dataSlotsSent;
     } else {
-        panic_if(msg->remainingTrailerSlots() == 0,
+        panic_if(msg.remainingTrailerSlots() == 0,
                  "CxlMemLink %s consumed continuation slot after completion",
                  name());
-        ++msg->trailerSlotsSent;
+        ++msg.trailerSlotsSent;
     }
 }
 
 void
-CxlMemLink::completeMessage(DirectionState &state,
-                            const ProtocolMessagePtr &msg,
+CxlMemLink::completeMessage(DirectionState &state, ProtocolMessagePtr msg,
                             Tick completion_tick)
 {
     msg->completionTick = completion_tick;
-    dequeueMessage(state, msg);
+    DPRINTF(CxlMemLink,
+            "complete %s %s addr %#x port %d start %llu done %llu "
+            "flits %llu data %llu/%llu trailer %llu/%llu queued_before %llu\n",
+            directionName(state.direction), messageClassName(msg->msgClass),
+            debugPacketAddr(msg->pkt), msg->portId,
+            static_cast<unsigned long long>(msg->serviceStartTick),
+            static_cast<unsigned long long>(completion_tick),
+            static_cast<unsigned long long>(msg->emittedFlits),
+            static_cast<unsigned long long>(msg->dataSlotsSent),
+            static_cast<unsigned long long>(msg->dataSlotsTotal),
+            static_cast<unsigned long long>(msg->trailerSlotsSent),
+            static_cast<unsigned long long>(msg->trailerSlotsTotal),
+            static_cast<unsigned long long>(state.queuedFlits));
+    dequeueMessage(state, *msg);
 
     LinkSchedule schedule;
     schedule.queueWait = msg->serviceStartTick - msg->arrivalTick;
@@ -380,9 +452,19 @@ CxlMemLink::completeMessage(DirectionState &state,
 
     if (state.direction == LinkDirection::M2S) {
         recordM2SPacket(msg->emittedFlits, schedule);
+        DPRINTF(CxlMemLink, "send %s %s addr %#x to mem_side[%d] at %llu\n",
+                directionName(state.direction),
+                messageClassName(msg->msgClass), debugPacketAddr(msg->pkt),
+                msg->portId,
+                static_cast<unsigned long long>(schedule.readyTick));
         memSidePort(msg->portId).schedTimingReq(msg->pkt, schedule.readyTick);
     } else {
         recordS2MPacket(msg->emittedFlits, schedule);
+        DPRINTF(CxlMemLink, "send %s %s addr %#x to cpu_side[%d] at %llu\n",
+                directionName(state.direction),
+                messageClassName(msg->msgClass), debugPacketAddr(msg->pkt),
+                msg->portId,
+                static_cast<unsigned long long>(schedule.readyTick));
         cpuSidePort(msg->portId).schedTimingResp(msg->pkt, schedule.readyTick);
     }
 }
@@ -452,10 +534,10 @@ CxlMemLink::isSlotLegal(MessageClass msg_class, bool header_slot) const
 }
 
 bool
-CxlMemLink::canStartDataHeader(const ProtocolMessagePtr &msg,
+CxlMemLink::canStartDataHeader(const ProtocolMessage &msg,
                                bool header_slot) const
 {
-    if (!msg->dataBearing()) {
+    if (!msg.dataBearing()) {
         return false;
     }
 
@@ -464,7 +546,7 @@ CxlMemLink::canStartDataHeader(const ProtocolMessagePtr &msg,
     }
 
     const uint64_t remaining =
-        msg->remainingDataSlots() + msg->remainingTrailerSlots();
+        msg.remainingDataSlots() + msg.remainingTrailerSlots();
     return remaining <= 16;
 }
 
@@ -516,10 +598,11 @@ CxlMemLink::packNdrHeaders(DirectionState &state, FlitBuildState &flit,
             break;
         }
 
+        auto completed = std::move(state.pending.front());
         state.pending.pop_front();
-        markHeaderSent(msg, flit_start);
-        recordGroupMessage(flit, msg->msgClass, slot, 1);
-        completeMessage(state, msg, flit_end);
+        markHeaderSent(*completed, flit_start);
+        recordGroupMessage(flit, completed->msgClass, slot, 1);
+        completeMessage(state, std::move(completed), flit_end);
         ++packed;
     }
 
@@ -539,7 +622,7 @@ CxlMemLink::startDataHeader(DirectionState &state, FlitBuildState &flit,
     if (msg->arrivalTick > flit_start || !msg->dataBearing()) {
         return false;
     }
-    if (!canStartDataHeader(msg, header_slot)) {
+    if (!canStartDataHeader(*msg, header_slot)) {
         panic("CxlMemLink %s cannot legally start %s in an H-slot with "
               "%llu remaining follow-on slots",
               name(),
@@ -552,11 +635,11 @@ CxlMemLink::startDataHeader(DirectionState &state, FlitBuildState &flit,
         return false;
     }
 
+    state.activeDataMsg = std::move(state.pending.front());
     state.pending.pop_front();
-    markHeaderSent(msg, flit_start);
-    recordGroupMessage(flit, msg->msgClass, slot, 1);
+    markHeaderSent(*state.activeDataMsg, flit_start);
+    recordGroupMessage(flit, state.activeDataMsg->msgClass, slot, 1);
     flit.startedDataHeader = true;
-    state.activeDataMsg = msg;
     return true;
 }
 
@@ -575,10 +658,11 @@ CxlMemLink::packReqHeader(DirectionState &state, FlitBuildState &flit,
         return false;
     }
 
+    auto completed = std::move(state.pending.front());
     state.pending.pop_front();
-    markHeaderSent(msg, flit_start);
-    recordGroupMessage(flit, msg->msgClass, slot, 1);
-    completeMessage(state, msg, flit_end);
+    markHeaderSent(*completed, flit_start);
+    recordGroupMessage(flit, completed->msgClass, slot, 1);
+    completeMessage(state, std::move(completed), flit_end);
     return true;
 }
 
@@ -621,6 +705,16 @@ CxlMemLink::processDirectionFlit(DirectionState &state)
     const Tick flit_end = flit_start + serializationDelay(1);
     FlitBuildState flit;
     bool emitted_payload = false;
+    DPRINTF(CxlMemLink,
+            "emit %s flit start %llu end %llu pending %llu active_addr %#x "
+            "queued %llu\n",
+            directionName(state.direction),
+            static_cast<unsigned long long>(flit_start),
+            static_cast<unsigned long long>(flit_end),
+            static_cast<unsigned long long>(state.pending.size()),
+            state.activeDataMsg ? debugPacketAddr(state.activeDataMsg->pkt)
+                                : 0,
+            static_cast<unsigned long long>(state.queuedFlits));
 
     for (int slot = 0; slot < 15; ++slot) {
         if (slot == 0 && state.activeDataMsg) {
@@ -628,12 +722,11 @@ CxlMemLink::processDirectionFlit(DirectionState &state)
         }
 
         if (slot > 0 && state.activeDataMsg) {
-            consumeContinuationSlot(state.activeDataMsg, flit_start);
+            consumeContinuationSlot(*state.activeDataMsg, flit_start);
             emitted_payload = true;
             if (state.activeDataMsg->complete()) {
-                const auto completed = state.activeDataMsg;
-                state.activeDataMsg.reset();
-                completeMessage(state, completed, flit_end);
+                auto completed = std::move(state.activeDataMsg);
+                completeMessage(state, std::move(completed), flit_end);
             }
             continue;
         }
@@ -658,6 +751,15 @@ CxlMemLink::processDirectionFlit(DirectionState &state)
     for (int i = 0; i < 2; ++i) {
         state.prevTailCounts[i] = flit.groupCounts[i][3];
     }
+    DPRINTF(CxlMemLink,
+            "emit %s flit done pending %llu active_addr %#x queued %llu "
+            "tail[%u,%u]\n",
+            directionName(state.direction),
+            static_cast<unsigned long long>(state.pending.size()),
+            state.activeDataMsg ? debugPacketAddr(state.activeDataMsg->pkt)
+                                : 0,
+            static_cast<unsigned long long>(state.queuedFlits),
+            state.prevTailCounts[0], state.prevTailCounts[1]);
 
     if (!state.pending.empty() || state.activeDataMsg) {
         maybeScheduleFlit(state, flit_end);
@@ -820,16 +922,24 @@ CxlMemLink::CxlResponsePort::recvTimingReq(PacketPtr pkt)
 
     if (expects_response) {
         link.reserveS2MResp(resp_flits);
+        DPRINTF(CxlMemLink,
+                "reserve S2M response addr %#x req_flits %llu resp_flits "
+                "%llu reserved %llu queued %llu\n",
+                link.debugPacketAddr(pkt),
+                static_cast<unsigned long long>(req_flits),
+                static_cast<unsigned long long>(resp_flits),
+                static_cast<unsigned long long>(link.reservedS2MFlits),
+                static_cast<unsigned long long>(link.s2mState.queuedFlits));
     }
 
     const Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
     pkt->headerDelay = pkt->payloadDelay = 0;
     const Tick arrival_tick = curTick() + receive_delay;
-    auto msg = std::make_shared<ProtocolMessage>(
+    auto msg = std::make_unique<ProtocolMessage>(
         msg_class, pkt, portId, arrival_tick,
         link.isDataBearing(msg_class) ? link.dataSlots(pkt) : 0,
         link.trailerSlots(msg_class, pkt), req_flits);
-    link.enqueueMessage(link.m2sState, msg);
+    link.enqueueMessage(link.m2sState, std::move(msg));
     return true;
 }
 
@@ -840,6 +950,11 @@ CxlMemLink::CxlRequestPort::schedTimingReq(PacketPtr pkt, Tick when)
         link.schedule(sendEvent, when);
     }
 
+    DPRINTF(CxlMemLink,
+            "queue mem_side[%d] req addr %#x at %llu txq_before %llu\n",
+            portId, link.debugPacketAddr(pkt),
+            static_cast<unsigned long long>(when),
+            static_cast<unsigned long long>(transmitList.size()));
     transmitList.emplace_back(pkt, when);
 }
 
@@ -850,6 +965,11 @@ CxlMemLink::CxlResponsePort::schedTimingResp(PacketPtr pkt, Tick when)
         link.schedule(sendEvent, when);
     }
 
+    DPRINTF(CxlMemLink,
+            "queue cpu_side[%d] resp addr %#x at %llu txq_before %llu\n",
+            portId, link.debugPacketAddr(pkt),
+            static_cast<unsigned long long>(when),
+            static_cast<unsigned long long>(transmitList.size()));
     transmitList.emplace_back(pkt, when);
 }
 
@@ -859,9 +979,19 @@ CxlMemLink::CxlRequestPort::trySendTiming()
     assert(!transmitList.empty());
 
     const DeferredPacket req = transmitList.front();
-    assert(req.tick <= curTick());
+    if (req.tick > curTick()) {
+        DPRINTF(CxlMemLink,
+                "defer mem_side[%d] req addr %#x until %llu current %llu\n",
+                portId, link.debugPacketAddr(req.pkt),
+                static_cast<unsigned long long>(req.tick),
+                static_cast<unsigned long long>(curTick()));
+        return;
+    }
 
     if (sendTimingReq(req.pkt)) {
+        DPRINTF(CxlMemLink, "sent mem_side[%d] req addr %#x txq_before %llu\n",
+                portId, link.debugPacketAddr(req.pkt),
+                static_cast<unsigned long long>(transmitList.size()));
         transmitList.pop_front();
 
         if (!transmitList.empty()) {
@@ -870,6 +1000,10 @@ CxlMemLink::CxlRequestPort::trySendTiming()
         }
 
         link.retryStalledReqs();
+    } else {
+        DPRINTF(CxlMemLink, "blocked mem_side[%d] req addr %#x txq %llu\n",
+                portId, link.debugPacketAddr(req.pkt),
+                static_cast<unsigned long long>(transmitList.size()));
     }
 }
 
@@ -879,9 +1013,20 @@ CxlMemLink::CxlResponsePort::trySendTiming()
     assert(!transmitList.empty());
 
     const DeferredPacket resp = transmitList.front();
-    assert(resp.tick <= curTick());
+    if (resp.tick > curTick()) {
+        DPRINTF(CxlMemLink,
+                "defer cpu_side[%d] resp addr %#x until %llu current %llu\n",
+                portId, link.debugPacketAddr(resp.pkt),
+                static_cast<unsigned long long>(resp.tick),
+                static_cast<unsigned long long>(curTick()));
+        return;
+    }
 
     if (sendTimingResp(resp.pkt)) {
+        DPRINTF(CxlMemLink,
+                "sent cpu_side[%d] resp addr %#x txq_before %llu\n", portId,
+                link.debugPacketAddr(resp.pkt),
+                static_cast<unsigned long long>(transmitList.size()));
         transmitList.pop_front();
 
         if (!transmitList.empty()) {
@@ -890,6 +1035,10 @@ CxlMemLink::CxlResponsePort::trySendTiming()
         }
 
         link.retryStalledReqs();
+    } else {
+        DPRINTF(CxlMemLink, "blocked cpu_side[%d] resp addr %#x txq %llu\n",
+                portId, link.debugPacketAddr(resp.pkt),
+                static_cast<unsigned long long>(transmitList.size()));
     }
 }
 
@@ -908,6 +1057,12 @@ CxlMemLink::CxlRequestPort::recvTimingResp(PacketPtr pkt)
              static_cast<unsigned long long>(link.s2mQueueDepthFlits));
 
     link.consumeS2MRespReservation(flits);
+    DPRINTF(CxlMemLink,
+            "consume S2M reservation addr %#x flits %llu reserved_left %llu "
+            "queued %llu\n",
+            link.debugPacketAddr(pkt), static_cast<unsigned long long>(flits),
+            static_cast<unsigned long long>(link.reservedS2MFlits),
+            static_cast<unsigned long long>(link.s2mState.queuedFlits));
     panic_if(!link.queueCanFit(link.s2mState, flits),
              "CxlMemLink %s S2M response exceeded actual queue capacity after "
              "reservation",
@@ -916,11 +1071,11 @@ CxlMemLink::CxlRequestPort::recvTimingResp(PacketPtr pkt)
     const Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
     pkt->headerDelay = pkt->payloadDelay = 0;
     const Tick arrival_tick = curTick() + receive_delay;
-    auto msg = std::make_shared<ProtocolMessage>(
+    auto msg = std::make_unique<ProtocolMessage>(
         msg_class, pkt, portId, arrival_tick,
         link.isDataBearing(msg_class) ? link.dataSlots(pkt) : 0,
         link.trailerSlots(msg_class, pkt), flits);
-    link.enqueueMessage(link.s2mState, msg);
+    link.enqueueMessage(link.s2mState, std::move(msg));
     return true;
 }
 
