@@ -10,19 +10,23 @@ class CxlMemLink(ClockedObject):
     cxx_header = "mem/cxl_mem_link.hh"
     cxx_class = "gem5::CxlMemLink"
 
-    mem_side_port = RequestPort(
-        "This port sends requests toward the memory device and receives responses"
+    mem_side_ports = VectorRequestPort(
+        "Ports that send requests toward backing media controllers and "
+        "receive responses"
     )
-    cpu_side_port = ResponsePort(
-        "This port receives host requests and sends responses back"
+    cpu_side_ports = VectorResponsePort(
+        "Ports that receive host requests and send responses back"
     )
 
-    ranges = VectorParam.AddrRange(
-        [AllMemory], "Host physical address ranges forwarded through this link"
+    port_ranges = VectorParam.AddrRange(
+        [AllMemory],
+        "One forwarded host physical address range per CPU-side ingress port",
     )
 
     flit_size_bytes = Param.Unsigned(
-        256, "CXL.cachemem flit payload mode to model, usually 68 or 256 bytes"
+        256,
+        "CXL.cachemem link mode to model, usually 68 or 256 bytes; in 256B "
+        "mode the implementation serializes payload at 16B slot granularity",
     )
     bandwidth = Param.MemoryBandwidth(
         "64GiB/s", "Per-direction CXL.mem serialization bandwidth"
@@ -35,10 +39,14 @@ class CxlMemLink(ClockedObject):
     )
 
     request_header_flits = Param.Unsigned(
-        1, "Simplified M2S CXL.mem request/control overhead in flits"
+        1,
+        "Simplified M2S CXL.mem header cost in serialized units; in 256B "
+        "mode one unit corresponds to one 16B slot",
     )
     response_header_flits = Param.Unsigned(
-        1, "Simplified S2M CXL.mem response/control overhead in flits"
+        1,
+        "Simplified S2M CXL.mem header cost in serialized units; in 256B "
+        "mode one unit corresponds to one 16B slot",
     )
     m2s_queue_depth_flits = Param.Unsigned(
         256, "Host-to-device FIFO capacity in CXL flits"

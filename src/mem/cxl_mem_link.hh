@@ -7,6 +7,7 @@
 #define __MEM_CXL_MEM_LINK_HH__
 
 #include <deque>
+#include <vector>
 
 #include "base/types.hh"
 #include "mem/port.hh"
@@ -20,9 +21,10 @@ namespace gem5
 /**
  * A deliberately abstract CXL Type 3 CXL.mem link model.
  *
- * The object is a two-port timing bridge. It does not enumerate a CXL device
- * or model CXL.io; it only adds flit-based FIFO and serialization delay
- * between the host/Ruby side and a backing memory controller. Optional
+ * The object is a shared timing bottleneck with matched vectors of CPU-side
+ * ingress ports and memory-side egress ports. It does not enumerate a CXL
+ * device or model CXL.io; it only adds flit-based FIFO and serialization
+ * delay between the host/Ruby side and backing memory controllers. Optional
  * base-link latency parameters are retained for calibration experiments, but
  * project configs default them to zero.
  */
@@ -55,26 +57,19 @@ class CxlMemLink : public ClockedObject
     {
       private:
         CxlMemLink &link;
-        CxlRequestPort &memSidePort;
+        const PortID portId;
         const AddrRangeList ranges;
 
         std::deque<DeferredPacket> transmitList;
-        uint64_t queuedFlits;
-        uint64_t reservedRespFlits;
         bool retryReq;
         EventFunctionWrapper sendEvent;
 
-        bool respQueueCanFit(uint64_t flits) const;
-        void reserveResp(uint64_t flits);
-        void consumeRespReservation(uint64_t flits);
         void schedTimingResp(PacketPtr pkt, Tick when, uint64_t flits);
-        void retryStalledReq();
         void trySendTiming();
 
       public:
         CxlResponsePort(const std::string &name, CxlMemLink &_link,
-                        CxlRequestPort &_mem_side_port,
-                        const std::vector<AddrRange> &_ranges);
+                        PortID _port_id, const AddrRange &_range);
 
       protected:
         bool recvTimingReq(PacketPtr pkt) override;
@@ -88,26 +83,25 @@ class CxlMemLink : public ClockedObject
         AddrRangeList getAddrRanges() const override;
 
         friend class CxlRequestPort;
+        friend class CxlMemLink;
     };
 
     class CxlRequestPort : public RequestPort
     {
       private:
         CxlMemLink &link;
-        CxlResponsePort &cpuSidePort;
+        const PortID portId;
 
         std::deque<DeferredPacket> transmitList;
-        uint64_t queuedFlits;
         EventFunctionWrapper sendEvent;
 
-        bool reqQueueCanFit(uint64_t flits) const;
         void schedTimingReq(PacketPtr pkt, Tick when, uint64_t flits);
         bool trySatisfyFunctional(PacketPtr pkt);
         void trySendTiming();
 
       public:
         CxlRequestPort(const std::string &name, CxlMemLink &_link,
-                       CxlResponsePort &_cpu_side_port);
+                       PortID _port_id);
 
       protected:
         bool recvTimingResp(PacketPtr pkt) override;
@@ -115,12 +109,13 @@ class CxlMemLink : public ClockedObject
         void recvRangeChange() override;
 
         friend class CxlResponsePort;
+        friend class CxlMemLink;
     };
 
-    CxlRequestPort memSidePort;
-    CxlResponsePort cpuSidePort;
+    std::vector<CxlRequestPort> memSidePorts;
+    std::vector<CxlResponsePort> cpuSidePorts;
 
-    const AddrRangeList ranges;
+    const std::vector<AddrRange> portRanges;
     const uint64_t flitSizeBytes;
     const double bandwidth;
     const Tick m2sLatency;
@@ -134,8 +129,13 @@ class CxlMemLink : public ClockedObject
     Tick nextS2MReady;
     Tick lastM2SQueueUpdate;
     Tick lastS2MQueueUpdate;
+    uint64_t queuedM2SFlits;
+    uint64_t queuedS2MFlits;
+    uint64_t reservedS2MFlits;
 
-    uint64_t dataFlits(PacketPtr pkt) const;
+    bool use256BSlotModel() const;
+    uint64_t serializationUnitBytes() const;
+    uint64_t dataUnits(PacketPtr pkt) const;
     uint64_t m2sRequestFlits(PacketPtr pkt) const;
     uint64_t s2mResponseFlitsForRequest(PacketPtr pkt) const;
     uint64_t s2mResponseFlits(PacketPtr pkt) const;
@@ -149,6 +149,19 @@ class CxlMemLink : public ClockedObject
     void recordS2MPacket(uint64_t flits, const LinkSchedule &schedule);
     void recordM2SStall();
     void recordS2MStall();
+    bool m2sQueueCanFit(uint64_t flits) const;
+    bool s2mQueueCanFit(uint64_t flits) const;
+    void reserveS2MResp(uint64_t flits);
+    void consumeS2MRespReservation(uint64_t flits);
+    void enqueueM2S(uint64_t flits);
+    void dequeueM2S(uint64_t flits);
+    void enqueueS2M(uint64_t flits);
+    void dequeueS2M(uint64_t flits);
+    void retryStalledReqs();
+    CxlRequestPort &memSidePort(PortID port_id);
+    const CxlRequestPort &memSidePort(PortID port_id) const;
+    CxlResponsePort &cpuSidePort(PortID port_id);
+    const CxlResponsePort &cpuSidePort(PortID port_id) const;
 
     statistics::Scalar m2sPackets;
     statistics::Scalar s2mPackets;

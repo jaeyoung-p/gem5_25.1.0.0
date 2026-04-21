@@ -15,33 +15,28 @@ namespace gem5
 {
 
 CxlMemLink::CxlRequestPort::CxlRequestPort(const std::string &name,
-                                           CxlMemLink &_link,
-                                           CxlResponsePort &_cpu_side_port)
+                                           CxlMemLink &_link, PortID _port_id)
     : RequestPort(name),
       link(_link),
-      cpuSidePort(_cpu_side_port),
-      queuedFlits(0),
+      portId(_port_id),
       sendEvent([this] { trySendTiming(); }, name)
 {}
 
-CxlMemLink::CxlResponsePort::CxlResponsePort(
-    const std::string &name, CxlMemLink &_link, CxlRequestPort &_mem_side_port,
-    const std::vector<AddrRange> &_ranges)
+CxlMemLink::CxlResponsePort::CxlResponsePort(const std::string &name,
+                                             CxlMemLink &_link,
+                                             PortID _port_id,
+                                             const AddrRange &_range)
     : ResponsePort(name),
       link(_link),
-      memSidePort(_mem_side_port),
-      ranges(_ranges.begin(), _ranges.end()),
-      queuedFlits(0),
-      reservedRespFlits(0),
+      portId(_port_id),
+      ranges({_range}),
       retryReq(false),
       sendEvent([this] { trySendTiming(); }, name)
 {}
 
 CxlMemLink::CxlMemLink(const Params &p)
     : ClockedObject(p),
-      memSidePort(p.name + ".mem_side_port", *this, cpuSidePort),
-      cpuSidePort(p.name + ".cpu_side_port", *this, memSidePort, p.ranges),
-      ranges(p.ranges.begin(), p.ranges.end()),
+      portRanges(p.port_ranges.begin(), p.port_ranges.end()),
       flitSizeBytes(p.flit_size_bytes),
       bandwidth(p.bandwidth),
       m2sLatency(p.m2s_latency),
@@ -54,6 +49,9 @@ CxlMemLink::CxlMemLink(const Params &p)
       nextS2MReady(0),
       lastM2SQueueUpdate(0),
       lastS2MQueueUpdate(0),
+      queuedM2SFlits(0),
+      queuedS2MFlits(0),
+      reservedS2MFlits(0),
       ADD_STAT(m2sPackets, statistics::units::Count::get(),
                "CXL.mem M2S packets accepted by the link"),
       ADD_STAT(s2mPackets, statistics::units::Count::get(),
@@ -92,16 +90,39 @@ CxlMemLink::CxlMemLink(const Params &p)
              "CxlMemLink header flit counts must be non-zero");
     fatal_if(m2sQueueDepthFlits == 0 || s2mQueueDepthFlits == 0,
              "CxlMemLink FIFO depths must be non-zero");
+
+    const auto cpu_port_count = p.port_cpu_side_ports_connection_count;
+    const auto mem_port_count = p.port_mem_side_ports_connection_count;
+    fatal_if(cpu_port_count == 0 || mem_port_count == 0,
+             "CxlMemLink requires at least one CPU-side and one mem-side "
+             "port connection");
+    fatal_if(cpu_port_count != mem_port_count,
+             "CxlMemLink requires matching CPU-side and mem-side port "
+             "counts, got %d CPU-side and %d mem-side ports",
+             cpu_port_count, mem_port_count);
+    fatal_if(portRanges.size() != cpu_port_count,
+             "CxlMemLink requires one port range per CPU-side port, got "
+             "%zu ranges for %d ports",
+             portRanges.size(), cpu_port_count);
+
+    for (PortID i = 0; i < mem_port_count; ++i) {
+        memSidePorts.emplace_back(csprintf("%s.mem_side_ports[%d]", name(), i),
+                                  *this, i);
+    }
+    for (PortID i = 0; i < cpu_port_count; ++i) {
+        cpuSidePorts.emplace_back(csprintf("%s.cpu_side_ports[%d]", name(), i),
+                                  *this, i, portRanges[i]);
+    }
 }
 
 Port &
 CxlMemLink::getPort(const std::string &if_name, PortID idx)
 {
-    if (if_name == "mem_side_port") {
-        return memSidePort;
+    if (if_name == "mem_side_ports" && idx < memSidePorts.size()) {
+        return memSidePorts[idx];
     }
-    if (if_name == "cpu_side_port") {
-        return cpuSidePort;
+    if (if_name == "cpu_side_ports" && idx < cpuSidePorts.size()) {
+        return cpuSidePorts[idx];
     }
     return ClockedObject::getPort(if_name, idx);
 }
@@ -109,17 +130,44 @@ CxlMemLink::getPort(const std::string &if_name, PortID idx)
 void
 CxlMemLink::init()
 {
-    if (!cpuSidePort.isConnected() || !memSidePort.isConnected()) {
-        fatal("Both ports of a CxlMemLink must be connected.\n");
-    }
+    fatal_if(cpuSidePorts.empty() || memSidePorts.empty(),
+             "CxlMemLink must have connected ports\n");
 
-    cpuSidePort.sendRangeChange();
+    for (PortID i = 0; i < cpuSidePorts.size(); ++i) {
+        if (!cpuSidePorts[i].isConnected() || !memSidePorts[i].isConnected()) {
+            fatal("Both ports of CxlMemLink channel %d must be connected.\n",
+                  i);
+        }
+        cpuSidePorts[i].sendRangeChange();
+    }
+}
+
+bool
+CxlMemLink::use256BSlotModel() const
+{
+    return flitSizeBytes == 256;
 }
 
 uint64_t
-CxlMemLink::dataFlits(PacketPtr pkt) const
+CxlMemLink::serializationUnitBytes() const
+{
+    // In 256B flit mode, CXL.cachemem messages are packed into 16B slots.
+    // We model the current link at slot granularity so RwD/DRS data-bearing
+    // messages pay for the extra data slots instead of charging a full 256B
+    // unit per header. For non-256B modes, keep the older whole-flit model.
+    return use256BSlotModel() ? 16 : flitSizeBytes;
+}
+
+uint64_t
+CxlMemLink::dataUnits(PacketPtr pkt) const
 {
     const uint64_t bytes = pkt->getSize();
+
+    if (use256BSlotModel()) {
+        const uint64_t slot_bytes = serializationUnitBytes();
+        return std::max<uint64_t>(1, (bytes + slot_bytes - 1) / slot_bytes);
+    }
+
     return (bytes + flitSizeBytes - 1) / flitSizeBytes;
 }
 
@@ -129,7 +177,7 @@ CxlMemLink::m2sRequestFlits(PacketPtr pkt) const
     uint64_t flits = requestHeaderFlits;
 
     if (pkt->isWrite()) {
-        flits += dataFlits(pkt);
+        flits += dataUnits(pkt);
     }
 
     return flits;
@@ -141,7 +189,7 @@ CxlMemLink::s2mResponseFlitsForRequest(PacketPtr pkt) const
     uint64_t flits = responseHeaderFlits;
 
     if (pkt->hasRespData()) {
-        flits += dataFlits(pkt);
+        flits += dataUnits(pkt);
     }
 
     return flits;
@@ -153,7 +201,7 @@ CxlMemLink::s2mResponseFlits(PacketPtr pkt) const
     uint64_t flits = responseHeaderFlits;
 
     if (pkt->hasData()) {
-        flits += dataFlits(pkt);
+        flits += dataUnits(pkt);
     }
 
     return flits;
@@ -162,8 +210,8 @@ CxlMemLink::s2mResponseFlits(PacketPtr pkt) const
 Tick
 CxlMemLink::serializationDelay(uint64_t flits) const
 {
-    return static_cast<Tick>(
-        std::ceil(static_cast<double>(flits * flitSizeBytes) * bandwidth));
+    return static_cast<Tick>(std::ceil(
+        static_cast<double>(flits * serializationUnitBytes()) * bandwidth));
 }
 
 CxlMemLink::LinkSchedule
@@ -245,38 +293,107 @@ CxlMemLink::recordS2MStall()
 }
 
 bool
-CxlMemLink::CxlRequestPort::reqQueueCanFit(uint64_t flits) const
+CxlMemLink::m2sQueueCanFit(uint64_t flits) const
 {
-    return queuedFlits + flits <= link.m2sQueueDepthFlits;
+    return queuedM2SFlits + flits <= m2sQueueDepthFlits;
 }
 
 bool
-CxlMemLink::CxlResponsePort::respQueueCanFit(uint64_t flits) const
+CxlMemLink::s2mQueueCanFit(uint64_t flits) const
 {
-    return queuedFlits + reservedRespFlits + flits <= link.s2mQueueDepthFlits;
+    return queuedS2MFlits + reservedS2MFlits + flits <= s2mQueueDepthFlits;
 }
 
 void
-CxlMemLink::CxlResponsePort::reserveResp(uint64_t flits)
+CxlMemLink::reserveS2MResp(uint64_t flits)
 {
-    link.accountS2MQueueOccupancy(queuedFlits);
-    reservedRespFlits += flits;
+    accountS2MQueueOccupancy(queuedS2MFlits);
+    reservedS2MFlits += flits;
 }
 
 void
-CxlMemLink::CxlResponsePort::consumeRespReservation(uint64_t flits)
+CxlMemLink::consumeS2MRespReservation(uint64_t flits)
 {
-    panic_if(reservedRespFlits < flits,
+    panic_if(reservedS2MFlits < flits,
              "CxlMemLink %s received a %llu-flit response with only "
              "%llu reserved S2M flits\n",
-             link.name(), flits, reservedRespFlits);
-    reservedRespFlits -= flits;
+             name(), flits, reservedS2MFlits);
+    reservedS2MFlits -= flits;
+}
+
+void
+CxlMemLink::enqueueM2S(uint64_t flits)
+{
+    accountM2SQueueOccupancy(queuedM2SFlits);
+    queuedM2SFlits += flits;
+}
+
+void
+CxlMemLink::dequeueM2S(uint64_t flits)
+{
+    accountM2SQueueOccupancy(queuedM2SFlits);
+    assert(queuedM2SFlits >= flits);
+    queuedM2SFlits -= flits;
+}
+
+void
+CxlMemLink::enqueueS2M(uint64_t flits)
+{
+    accountS2MQueueOccupancy(queuedS2MFlits);
+    queuedS2MFlits += flits;
+}
+
+void
+CxlMemLink::dequeueS2M(uint64_t flits)
+{
+    accountS2MQueueOccupancy(queuedS2MFlits);
+    assert(queuedS2MFlits >= flits);
+    queuedS2MFlits -= flits;
+}
+
+void
+CxlMemLink::retryStalledReqs()
+{
+    for (auto &port : cpuSidePorts) {
+        if (port.retryReq) {
+            port.retryReq = false;
+            port.sendRetryReq();
+        }
+    }
+}
+
+CxlMemLink::CxlRequestPort &
+CxlMemLink::memSidePort(PortID port_id)
+{
+    assert(port_id < memSidePorts.size());
+    return memSidePorts[port_id];
+}
+
+const CxlMemLink::CxlRequestPort &
+CxlMemLink::memSidePort(PortID port_id) const
+{
+    assert(port_id < memSidePorts.size());
+    return memSidePorts[port_id];
+}
+
+CxlMemLink::CxlResponsePort &
+CxlMemLink::cpuSidePort(PortID port_id)
+{
+    assert(port_id < cpuSidePorts.size());
+    return cpuSidePorts[port_id];
+}
+
+const CxlMemLink::CxlResponsePort &
+CxlMemLink::cpuSidePort(PortID port_id) const
+{
+    assert(port_id < cpuSidePorts.size());
+    return cpuSidePorts[port_id];
 }
 
 bool
 CxlMemLink::CxlResponsePort::recvTimingReq(PacketPtr pkt)
 {
-    DPRINTF(CxlMemLink, "recvTimingReq: %s addr %#x size %u\n",
+    DPRINTF(CxlMemLink, "recvTimingReq[%d]: %s addr %#x size %u\n", portId,
             pkt->cmdString(), pkt->getAddr(), pkt->getSize());
 
     panic_if(pkt->cacheResponding(), "CxlMemLink should not see packets "
@@ -300,15 +417,15 @@ CxlMemLink::CxlResponsePort::recvTimingReq(PacketPtr pkt)
              "is only %llu flits\n",
              link.name(), resp_flits, link.s2mQueueDepthFlits);
 
-    if (!memSidePort.reqQueueCanFit(req_flits)) {
+    if (!link.m2sQueueCanFit(req_flits)) {
         link.recordM2SStall();
         retryReq = true;
-    } else if (expects_response && !respQueueCanFit(resp_flits)) {
+    } else if (expects_response && !link.s2mQueueCanFit(resp_flits)) {
         link.recordS2MStall();
         retryReq = true;
     } else {
         if (expects_response) {
-            reserveResp(resp_flits);
+            link.reserveS2MResp(resp_flits);
         }
 
         const Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
@@ -316,7 +433,8 @@ CxlMemLink::CxlResponsePort::recvTimingReq(PacketPtr pkt)
         const auto schedule =
             link.scheduleM2S(curTick() + receive_delay, req_flits);
         link.recordM2SPacket(req_flits, schedule);
-        memSidePort.schedTimingReq(pkt, schedule.readyTick, req_flits);
+        link.memSidePort(portId).schedTimingReq(pkt, schedule.readyTick,
+                                                req_flits);
     }
 
     return !retryReq;
@@ -330,8 +448,7 @@ CxlMemLink::CxlRequestPort::schedTimingReq(PacketPtr pkt, Tick when,
         link.schedule(sendEvent, when);
     }
 
-    link.accountM2SQueueOccupancy(queuedFlits);
-    queuedFlits += flits;
+    link.enqueueM2S(flits);
     transmitList.emplace_back(pkt, when, flits);
 }
 
@@ -343,8 +460,7 @@ CxlMemLink::CxlResponsePort::schedTimingResp(PacketPtr pkt, Tick when,
         link.schedule(sendEvent, when);
     }
 
-    link.accountS2MQueueOccupancy(queuedFlits);
-    queuedFlits += flits;
+    link.enqueueS2M(flits);
     transmitList.emplace_back(pkt, when, flits);
 }
 
@@ -358,17 +474,14 @@ CxlMemLink::CxlRequestPort::trySendTiming()
 
     if (sendTimingReq(req.pkt)) {
         transmitList.pop_front();
-
-        link.accountM2SQueueOccupancy(queuedFlits);
-        assert(queuedFlits >= req.flits);
-        queuedFlits -= req.flits;
+        link.dequeueM2S(req.flits);
 
         if (!transmitList.empty()) {
             const DeferredPacket next_req = transmitList.front();
             link.schedule(sendEvent, std::max(next_req.tick, curTick()));
         }
 
-        cpuSidePort.retryStalledReq();
+        link.retryStalledReqs();
     }
 }
 
@@ -382,27 +495,21 @@ CxlMemLink::CxlResponsePort::trySendTiming()
 
     if (sendTimingResp(resp.pkt)) {
         transmitList.pop_front();
-
-        link.accountS2MQueueOccupancy(queuedFlits);
-        assert(queuedFlits >= resp.flits);
-        queuedFlits -= resp.flits;
+        link.dequeueS2M(resp.flits);
 
         if (!transmitList.empty()) {
             const DeferredPacket next_resp = transmitList.front();
             link.schedule(sendEvent, std::max(next_resp.tick, curTick()));
         }
 
-        if (retryReq && memSidePort.queuedFlits < link.m2sQueueDepthFlits) {
-            retryReq = false;
-            sendRetryReq();
-        }
+        link.retryStalledReqs();
     }
 }
 
 bool
 CxlMemLink::CxlRequestPort::recvTimingResp(PacketPtr pkt)
 {
-    DPRINTF(CxlMemLink, "recvTimingResp: %s addr %#x size %u\n",
+    DPRINTF(CxlMemLink, "recvTimingResp[%d]: %s addr %#x size %u\n", portId,
             pkt->cmdString(), pkt->getAddr(), pkt->getSize());
 
     const uint64_t flits = link.s2mResponseFlits(pkt);
@@ -411,24 +518,15 @@ CxlMemLink::CxlRequestPort::recvTimingResp(PacketPtr pkt)
              "only %llu flits\n",
              link.name(), flits, link.s2mQueueDepthFlits);
 
-    cpuSidePort.consumeRespReservation(flits);
+    link.consumeS2MRespReservation(flits);
 
     const Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
     pkt->headerDelay = pkt->payloadDelay = 0;
     const auto schedule = link.scheduleS2M(curTick() + receive_delay, flits);
     link.recordS2MPacket(flits, schedule);
-    cpuSidePort.schedTimingResp(pkt, schedule.readyTick, flits);
+    link.cpuSidePort(portId).schedTimingResp(pkt, schedule.readyTick, flits);
 
     return true;
-}
-
-void
-CxlMemLink::CxlResponsePort::retryStalledReq()
-{
-    if (retryReq) {
-        retryReq = false;
-        sendRetryReq();
-    }
 }
 
 void
@@ -452,7 +550,7 @@ CxlMemLink::CxlResponsePort::recvAtomic(PacketPtr pkt)
     Tick latency =
         link.m2sLatency + link.serializationDelay(link.m2sRequestFlits(pkt));
     const bool expects_response = pkt->needsResponse();
-    latency += memSidePort.sendAtomic(pkt);
+    latency += link.memSidePort(portId).sendAtomic(pkt);
     if (expects_response) {
         latency += link.s2mLatency +
                    link.serializationDelay(link.s2mResponseFlits(pkt));
@@ -467,7 +565,7 @@ CxlMemLink::CxlResponsePort::recvAtomicBackdoor(PacketPtr pkt,
     Tick latency =
         link.m2sLatency + link.serializationDelay(link.m2sRequestFlits(pkt));
     const bool expects_response = pkt->needsResponse();
-    latency += memSidePort.sendAtomicBackdoor(pkt, backdoor);
+    latency += link.memSidePort(portId).sendAtomicBackdoor(pkt, backdoor);
     if (expects_response) {
         latency += link.s2mLatency +
                    link.serializationDelay(link.s2mResponseFlits(pkt));
@@ -487,19 +585,19 @@ CxlMemLink::CxlResponsePort::recvFunctional(PacketPtr pkt)
         }
     }
 
-    if (memSidePort.trySatisfyFunctional(pkt)) {
+    if (link.memSidePort(portId).trySatisfyFunctional(pkt)) {
         return;
     }
 
     pkt->popLabel();
-    memSidePort.sendFunctional(pkt);
+    link.memSidePort(portId).sendFunctional(pkt);
 }
 
 void
 CxlMemLink::CxlResponsePort::recvMemBackdoorReq(const MemBackdoorReq &req,
                                                 MemBackdoorPtr &backdoor)
 {
-    memSidePort.sendMemBackdoorReq(req, backdoor);
+    link.memSidePort(portId).sendMemBackdoorReq(req, backdoor);
 }
 
 bool
@@ -518,7 +616,7 @@ CxlMemLink::CxlRequestPort::trySatisfyFunctional(PacketPtr pkt)
 void
 CxlMemLink::CxlRequestPort::recvRangeChange()
 {
-    cpuSidePort.sendRangeChange();
+    link.cpuSidePort(portId).sendRangeChange();
 }
 
 AddrRangeList

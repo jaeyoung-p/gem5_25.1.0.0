@@ -57,8 +57,8 @@ class TwoTierMemory(AbstractMemorySystem):
     guest physical ranges only because x86 reserves the 3-4 GiB PCI hole. The
     low and high halves use identical interleaving and timing, but separate
     AbstractMemory objects so KVM backs exactly the ranges Linux sees. Node 1 is
-    unchanged: a 64 GiB high-address memory-only node reached through CXL.mem
-    flit links before its DDR5 media.
+    a 64 GiB high-address memory-only node reached through one shared CXL.mem
+    bottleneck before its two backing DDR5 media controllers.
     """
 
     _node0_low_start = 0
@@ -117,21 +117,16 @@ class TwoTierMemory(AbstractMemorySystem):
             num_channels=self._node1_channels,
             static_latency="10ns",
         )
-        self.slow_cxl_links = [
-            CxlMemLink(
-                flit_size_bytes=cxl_flit_size_bytes,
-                bandwidth=cxl_link_bandwidth,
-                m2s_latency=cxl_base_latency,
-                s2m_latency=cxl_base_latency,
-                m2s_queue_depth_flits=cxl_queue_depth_flits,
-                s2m_queue_depth_flits=cxl_queue_depth_flits,
-            )
-            for _ in range(self._node1_channels)
-        ]
+        self.slow_cxl_link = CxlMemLink(
+            flit_size_bytes=cxl_flit_size_bytes,
+            bandwidth=cxl_link_bandwidth,
+            m2s_latency=cxl_base_latency,
+            s2m_latency=cxl_base_latency,
+            m2s_queue_depth_flits=cxl_queue_depth_flits,
+            s2m_queue_depth_flits=cxl_queue_depth_flits,
+        )
         for channel in range(self._node1_channels):
-            self.slow_cxl_links[channel].mem_side_port = self.slow_ctrls[
-                channel
-            ].port
+            self.slow_cxl_link.mem_side_ports = self.slow_ctrls[channel].port
 
         self.set_memory_range(self.get_default_memory_ranges())
 
@@ -175,7 +170,7 @@ class TwoTierMemory(AbstractMemorySystem):
             channel_ranges.append(channel_range)
         return channel_ranges
 
-    def _configure_slow_cxl_links(self) -> None:
+    def _configure_slow_cxl_link(self) -> None:
         slow_channel_ranges = [
             self._interleaved_range(
                 self.node1_ranges[0], channel, self._node1_channels
@@ -183,8 +178,7 @@ class TwoTierMemory(AbstractMemorySystem):
             for channel in range(self._node1_channels)
         ]
 
-        for channel, link in enumerate(self.slow_cxl_links):
-            link.ranges = [slow_channel_ranges[channel]]
+        self.slow_cxl_link.port_ranges = slow_channel_ranges
 
         object.__setattr__(self, "node1_channel_ranges", slow_channel_ranges)
 
@@ -219,7 +213,7 @@ class TwoTierMemory(AbstractMemorySystem):
         return self._node0_ctrls[0].port
 
     def get_slow_port(self) -> Port:
-        return self.slow_cxl_links[0].cpu_side_port
+        return self.slow_cxl_link.cpu_side_ports[0]
 
     @overrides(AbstractMemorySystem)
     def incorporate_memory(self, board: AbstractBoard) -> None:
@@ -247,7 +241,7 @@ class TwoTierMemory(AbstractMemorySystem):
         ] + [
             (
                 self.node1_channel_ranges[channel],
-                self.slow_cxl_links[channel].cpu_side_port,
+                self.slow_cxl_link.cpu_side_ports[channel],
             )
             for channel in range(self._node1_channels)
         ]
@@ -304,4 +298,4 @@ class TwoTierMemory(AbstractMemorySystem):
         self._interleave_range(
             self.slow_ctrls, self.node1_ranges[0], self._node1_channels
         )
-        self._configure_slow_cxl_links()
+        self._configure_slow_cxl_link()
