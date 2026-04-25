@@ -47,18 +47,24 @@ from m5.util.convert import toMemorySize
 from ...utils.override import overrides
 from ..boards.abstract_board import AbstractBoard
 from .abstract_memory_system import AbstractMemorySystem
-from .dram_interfaces.ddr5 import DDR5_6400_4x8_32GiB
+from .dram_interfaces.ddr5 import (
+    DDR5_4400_4x8_8GiB,
+    DDR5_4400_4x8_32GiB,
+)
 
 
 class TwoTierMemory(AbstractMemorySystem):
     """Local 8-channel DDR5 node plus a CXL-like memory-only node.
 
     Node 0 is one uniform 8-channel DDR5 memory system split into low and high
-    guest physical ranges only because x86 reserves the 3-4 GiB PCI hole. The
-    low and high halves use identical interleaving and timing, but separate
-    AbstractMemory objects so KVM backs exactly the ranges Linux sees. Node 1 is
-    a 64 GiB high-address memory-only node reached through one shared CXL.mem
-    bottleneck before its two backing DDR5 media controllers.
+    guest physical ranges only because x86 reserves the 3-4 GiB PCI hole. gem5's
+    DDR5_4400_4x8 model is one 32-bit DDR5 subchannel, so the 8 logical
+    64-bit node0 channels are modeled as 16 subchannels. The low and high
+    halves use identical interleaving and timing, but separate AbstractMemory
+    objects so KVM backs exactly the ranges Linux sees. Node 1 is a 64 GiB
+    high-address memory-only node reached through one shared CXL.mem bottleneck
+    before its two logical 64-bit DDR5 channels, modeled as four x32
+    subchannels.
     """
 
     _node0_low_start = 0
@@ -67,15 +73,15 @@ class TwoTierMemory(AbstractMemorySystem):
     _node0_high_size = "61GiB"
     _node1_start = 0x1040000000
     _node1_size = "64GiB"
-    _node0_channels = 8
-    _node1_channels = 2
+    _node0_channels = 16
+    _node1_channels = 4
     _interleaving_size = 64
 
     def __init__(
         self,
         cxl_flit_size_bytes: int = 256,
         cxl_link_bandwidth: str = "64GiB/s",
-        cxl_base_latency: str = "0ns",
+        cxl_base_latency: str = "60ns",
         cxl_queue_depth_flits: int = 256,
     ) -> None:
         super().__init__()
@@ -102,10 +108,12 @@ class TwoTierMemory(AbstractMemorySystem):
 
         self.node0_low_ctrls = self._create_channel_group(
             num_channels=self._node0_channels,
+            dram_cls=DDR5_4400_4x8_8GiB,
             static_latency="10ns",
         )
         self.node0_high_ctrls = self._create_channel_group(
             num_channels=self._node0_channels,
+            dram_cls=DDR5_4400_4x8_8GiB,
             static_latency="10ns",
         )
         object.__setattr__(
@@ -115,6 +123,7 @@ class TwoTierMemory(AbstractMemorySystem):
         )
         self.slow_ctrls = self._create_channel_group(
             num_channels=self._node1_channels,
+            dram_cls=DDR5_4400_4x8_32GiB,
             static_latency="10ns",
         )
         self.slow_cxl_link = CxlMemLink(
@@ -131,11 +140,9 @@ class TwoTierMemory(AbstractMemorySystem):
         self.set_memory_range(self.get_default_memory_ranges())
 
     def _create_channel_group(
-        self, num_channels: int, static_latency: str
+        self, num_channels: int, dram_cls, static_latency: str
     ) -> List[MemCtrl]:
-        ctrls = [
-            MemCtrl(dram=DDR5_6400_4x8_32GiB()) for _ in range(num_channels)
-        ]
+        ctrls = [MemCtrl(dram=dram_cls()) for _ in range(num_channels)]
 
         for ctrl in ctrls:
             ctrl.static_frontend_latency = static_latency

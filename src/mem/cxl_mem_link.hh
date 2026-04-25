@@ -33,7 +33,7 @@ namespace gem5
  * 256B flit subset for the memory-only NUMA path:
  * - direct-attached Type 3-style M2S/S2M traffic only
  * - explicit internal message types for Req/RwD/NDR/DRS
- * - one active data-header start per emitted flit
+ * - multiple complete small data-header messages per emitted flit
  * - rollover of data-bearing messages across flits
  * - no BISnp/BIRsp, LOpt 256B halves, CRC/FEC, or replay correctness model
  */
@@ -139,7 +139,7 @@ class CxlMemLink : public ClockedObject
             {0, 0, 0, 0},
             {0, 0, 0, 0},
         }};
-        bool startedDataHeader = false;
+        uint32_t dataHeaderStarts = 0;
     };
 
     class CxlRequestPort;
@@ -266,12 +266,15 @@ class CxlMemLink : public ClockedObject
                             int slot, uint32_t count);
     uint32_t packNdrHeaders(DirectionState &state, FlitBuildState &flit,
                             int slot, Tick flit_start, Tick flit_end);
+    uint32_t packCompleteDataMessage(DirectionState &state,
+                                     FlitBuildState &flit, int slot,
+                                     Tick flit_start, Tick flit_end);
     bool startDataHeader(DirectionState &state, FlitBuildState &flit, int slot,
                          Tick flit_start);
     bool packReqHeader(DirectionState &state, FlitBuildState &flit, int slot,
                        Tick flit_start, Tick flit_end);
-    bool packHeaderSlot(DirectionState &state, FlitBuildState &flit, int slot,
-                        Tick flit_start, Tick flit_end);
+    uint32_t packHeaderSlot(DirectionState &state, FlitBuildState &flit,
+                            int slot, Tick flit_start, Tick flit_end);
 
     void accountM2SQueueOccupancy(uint64_t queued_flits);
     void accountS2MQueueOccupancy(uint64_t queued_flits);

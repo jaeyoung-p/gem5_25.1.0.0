@@ -609,6 +609,47 @@ CxlMemLink::packNdrHeaders(DirectionState &state, FlitBuildState &flit,
     return packed;
 }
 
+uint32_t
+CxlMemLink::packCompleteDataMessage(DirectionState &state,
+                                    FlitBuildState &flit, int slot,
+                                    Tick flit_start, Tick flit_end)
+{
+    if (state.pending.empty()) {
+        return 0;
+    }
+
+    const auto &msg = state.pending.front();
+    if (msg->arrivalTick > flit_start || !msg->dataBearing()) {
+        return 0;
+    }
+
+    const uint64_t follow_slots =
+        msg->remainingDataSlots() + msg->remainingTrailerSlots();
+    const uint64_t available_follow_slots = 14 - slot;
+    if (follow_slots > available_follow_slots) {
+        return 0;
+    }
+    if (!canPackGroupMessage(state, flit, msg->msgClass, slot, 1)) {
+        return 0;
+    }
+
+    auto completed = std::move(state.pending.front());
+    state.pending.pop_front();
+    markHeaderSent(*completed, flit_start);
+    recordGroupMessage(flit, completed->msgClass, slot, 1);
+    ++flit.dataHeaderStarts;
+
+    for (uint64_t i = 0; i < follow_slots; ++i) {
+        consumeContinuationSlot(*completed, flit_start);
+    }
+    panic_if(!completed->complete(),
+             "CxlMemLink %s failed to complete an in-flit data message",
+             name());
+    completeMessage(state, std::move(completed), flit_end);
+
+    return 1 + follow_slots;
+}
+
 bool
 CxlMemLink::startDataHeader(DirectionState &state, FlitBuildState &flit,
                             int slot, Tick flit_start)
@@ -622,6 +663,12 @@ CxlMemLink::startDataHeader(DirectionState &state, FlitBuildState &flit,
     if (msg->arrivalTick > flit_start || !msg->dataBearing()) {
         return false;
     }
+    const uint64_t follow_slots =
+        msg->remainingDataSlots() + msg->remainingTrailerSlots();
+    if (follow_slots <= 14 &&
+        follow_slots > static_cast<uint64_t>(14 - slot)) {
+        return false;
+    }
     if (!canStartDataHeader(*msg, header_slot)) {
         panic("CxlMemLink %s cannot legally start %s in an H-slot with "
               "%llu remaining follow-on slots",
@@ -630,7 +677,7 @@ CxlMemLink::startDataHeader(DirectionState &state, FlitBuildState &flit,
               static_cast<unsigned long long>(msg->remainingDataSlots() +
                                               msg->remainingTrailerSlots()));
     }
-    if (flit.startedDataHeader ||
+    if (flit.dataHeaderStarts != 0 ||
         !canPackGroupMessage(state, flit, msg->msgClass, slot, 1)) {
         return false;
     }
@@ -639,7 +686,7 @@ CxlMemLink::startDataHeader(DirectionState &state, FlitBuildState &flit,
     state.pending.pop_front();
     markHeaderSent(*state.activeDataMsg, flit_start);
     recordGroupMessage(flit, state.activeDataMsg->msgClass, slot, 1);
-    flit.startedDataHeader = true;
+    ++flit.dataHeaderStarts;
     return true;
 }
 
@@ -666,32 +713,38 @@ CxlMemLink::packReqHeader(DirectionState &state, FlitBuildState &flit,
     return true;
 }
 
-bool
+uint32_t
 CxlMemLink::packHeaderSlot(DirectionState &state, FlitBuildState &flit,
                            int slot, Tick flit_start, Tick flit_end)
 {
     if (state.pending.empty()) {
-        return false;
+        return 0;
     }
 
     const auto &msg = state.pending.front();
     if (msg->arrivalTick > flit_start) {
-        return false;
+        return 0;
     }
 
     switch (msg->msgClass) {
         case MessageClass::M2SReq:
-            return packReqHeader(state, flit, slot, flit_start, flit_end);
+            return packReqHeader(state, flit, slot, flit_start, flit_end) ? 1
+                                                                          : 0;
         case MessageClass::S2MNDR:
-            return packNdrHeaders(state, flit, slot, flit_start, flit_end) !=
-                   0;
+            return packNdrHeaders(state, flit, slot, flit_start, flit_end) != 0
+                       ? 1
+                       : 0;
         case MessageClass::M2SRwD:
         case MessageClass::S2MDRS:
-            return startDataHeader(state, flit, slot, flit_start);
+            if (const uint32_t consumed = packCompleteDataMessage(
+                    state, flit, slot, flit_start, flit_end)) {
+                return consumed;
+            }
+            return startDataHeader(state, flit, slot, flit_start) ? 1 : 0;
     }
 
     panic("Unreachable CXL.mem message class");
-    return false;
+    return 0;
 }
 
 void
@@ -716,8 +769,9 @@ CxlMemLink::processDirectionFlit(DirectionState &state)
                                 : 0,
             static_cast<unsigned long long>(state.queuedFlits));
 
-    for (int slot = 0; slot < 15; ++slot) {
+    for (int slot = 0; slot < 15;) {
         if (slot == 0 && state.activeDataMsg) {
+            ++slot;
             continue;
         }
 
@@ -728,11 +782,16 @@ CxlMemLink::processDirectionFlit(DirectionState &state)
                 auto completed = std::move(state.activeDataMsg);
                 completeMessage(state, std::move(completed), flit_end);
             }
+            ++slot;
             continue;
         }
 
-        if (packHeaderSlot(state, flit, slot, flit_start, flit_end)) {
+        if (const uint32_t consumed =
+                packHeaderSlot(state, flit, slot, flit_start, flit_end)) {
             emitted_payload = true;
+            slot += consumed;
+        } else {
+            ++slot;
         }
     }
 

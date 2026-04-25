@@ -252,6 +252,28 @@ class DDR5_6400_4x8_32GiB(DDR5_6400_4x8):
     ranks_per_channel = 2
 
 
+class DDR5_4400_4x8_32GiB(DDR5_4400_4x8):
+    """One 32-bit DDR5-4400 subchannel with 32GiB modeled capacity."""
+
+    # 32Gb x8 devices: 4GiB per device.
+    device_size = "4GiB"
+
+    # Four x8 devices make one x32 subchannel rank; two ranks make 32GiB.
+    devices_per_rank = 4
+    ranks_per_channel = 2
+
+
+class DDR5_4400_4x8_8GiB(DDR5_4400_4x8):
+    """One 32-bit DDR5-4400 subchannel with 8GiB modeled capacity."""
+
+    # 8Gb x8 devices: 1GiB per device.
+    device_size = "1GiB"
+
+    # Four x8 devices make one x32 subchannel rank; two ranks make 8GiB.
+    devices_per_rank = 4
+    ranks_per_channel = 2
+
+
 # Maximum bandwidth of DDR5_8400_4x8 (8400 MT/s) can be 33.6GB/s
 # Most of the timing parameters for DDR5_8400_4x8 are TBD in
 # the datasheet referred above.

@@ -348,6 +348,18 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     }
   }
 
+  action(qft_queueMemoryFetchRequestDMATBE, "qft",
+         desc="Queue off-chip fetch request for a DMA TBE") {
+      enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+        assert(is_valid(tbe));
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_READ;
+        out_msg.Sender := tbe.Requestor;
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+        out_msg.Len := 0;
+      }
+  }
+
   action(p_popIncomingDMARequestQueue, "p", desc="Pop incoming DMA queue") {
     requestNetwork_in.dequeue(clockEdge());
   }
@@ -539,6 +551,12 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     k_popIncomingResponseQueue;
   }
 
+  transition(M_DRD, CleanReplacement, ID) {
+    a_sendAck;
+    qft_queueMemoryFetchRequestDMATBE;
+    k_popIncomingResponseQueue;
+  }
+
   transition(M_DRDI, Memory_Ack, I) {
     aa_sendAck;
     l_popMemQueue;
@@ -552,6 +570,12 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   }
 
   transition(M_DWR, Data, M_DWRI) {
+    qw_queueMemoryWBRequest_partialTBE;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(M_DWR, CleanReplacement, M_DWRI) {
+    a_sendAck;
     qw_queueMemoryWBRequest_partialTBE;
     k_popIncomingResponseQueue;
   }
