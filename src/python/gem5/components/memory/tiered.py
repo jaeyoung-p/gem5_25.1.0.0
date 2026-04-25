@@ -83,6 +83,7 @@ class TwoTierMemory(AbstractMemorySystem):
         cxl_link_bandwidth: str = "64GiB/s",
         cxl_base_latency: str = "60ns",
         cxl_queue_depth_flits: int = 256,
+        aes_latency: str = "0ns",
     ) -> None:
         super().__init__()
 
@@ -110,11 +111,13 @@ class TwoTierMemory(AbstractMemorySystem):
             num_channels=self._node0_channels,
             dram_cls=DDR5_4400_4x8_8GiB,
             static_latency="10ns",
+            aes_latency=aes_latency,
         )
         self.node0_high_ctrls = self._create_channel_group(
             num_channels=self._node0_channels,
             dram_cls=DDR5_4400_4x8_8GiB,
             static_latency="10ns",
+            aes_latency=aes_latency,
         )
         object.__setattr__(
             self,
@@ -125,6 +128,7 @@ class TwoTierMemory(AbstractMemorySystem):
             num_channels=self._node1_channels,
             dram_cls=DDR5_4400_4x8_32GiB,
             static_latency="10ns",
+            aes_latency=aes_latency,
         )
         self.slow_cxl_link = CxlMemLink(
             flit_size_bytes=cxl_flit_size_bytes,
@@ -140,13 +144,18 @@ class TwoTierMemory(AbstractMemorySystem):
         self.set_memory_range(self.get_default_memory_ranges())
 
     def _create_channel_group(
-        self, num_channels: int, dram_cls, static_latency: str
+        self,
+        num_channels: int,
+        dram_cls,
+        static_latency: str,
+        aes_latency: str,
     ) -> List[MemCtrl]:
         ctrls = [MemCtrl(dram=dram_cls()) for _ in range(num_channels)]
 
         for ctrl in ctrls:
             ctrl.static_frontend_latency = static_latency
             ctrl.static_backend_latency = static_latency
+            ctrl.aes_latency = aes_latency
 
         return ctrls
 

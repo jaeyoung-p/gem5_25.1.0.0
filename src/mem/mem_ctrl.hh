@@ -538,6 +538,9 @@ class MemCtrl : public qos::MemCtrl
      */
     const Tick backendLatency;
 
+    /** Fixed AES processing latency added before responding upstream. */
+    const Tick aesLatency;
+
     /**
      * Length of a command window, used to check
      * command bandwidth

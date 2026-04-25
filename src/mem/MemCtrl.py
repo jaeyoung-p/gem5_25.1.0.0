@@ -98,6 +98,11 @@ class MemCtrl(QoSMemCtrl):
     # serviced by the memory seeing the sum of the two
     static_frontend_latency = Param.Latency("10ns", "Static frontend latency")
     static_backend_latency = Param.Latency("10ns", "Static backend latency")
+    aes_latency = Param.Latency(
+        "0ns",
+        "Fixed AES processing latency added before the memory controller "
+        "responds upstream.",
+    )
 
     command_window = Param.Latency("10ns", "Static backend latency")
     disable_sanity_check = Param.Bool(False, "Disable port resp Q size check")
