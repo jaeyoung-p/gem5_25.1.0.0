@@ -37,6 +37,11 @@ class CxlMemLink(ClockedObject):
     s2m_latency = Param.Latency(
         "0ns", "Optional fixed device-to-host CXL.mem link latency"
     )
+    extra_data_slots = Param.Unsigned(
+        0,
+        "Extra modeled 16B data slots added to each data-bearing CXL.mem "
+        "message",
+    )
 
     request_header_flits = Param.Unsigned(
         1,

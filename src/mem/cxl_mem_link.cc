@@ -83,6 +83,7 @@ CxlMemLink::CxlMemLink(const Params &p)
       bandwidth(p.bandwidth),
       m2sLatency(p.m2s_latency),
       s2mLatency(p.s2m_latency),
+      extraDataSlots(p.extra_data_slots),
       requestHeaderFlits(p.request_header_flits),
       responseHeaderFlits(p.response_header_flits),
       m2sQueueDepthFlits(p.m2s_queue_depth_flits),
@@ -263,7 +264,7 @@ uint64_t
 CxlMemLink::dataSlots(PacketPtr pkt) const
 {
     const uint64_t bytes = pkt->getSize();
-    return std::max<uint64_t>(1, (bytes + 15) / 16);
+    return std::max<uint64_t>(1, (bytes + 15) / 16) + extraDataSlots;
 }
 
 uint64_t

@@ -211,6 +211,7 @@ class CxlMemLink : public ClockedObject
     const double bandwidth;
     const Tick m2sLatency;
     const Tick s2mLatency;
+    const uint64_t extraDataSlots;
     const uint64_t requestHeaderFlits;
     const uint64_t responseHeaderFlits;
     const uint64_t m2sQueueDepthFlits;

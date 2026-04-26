@@ -83,6 +83,7 @@ class TwoTierMemory(AbstractMemorySystem):
         cxl_link_bandwidth: str = "64GiB/s",
         cxl_base_latency: str = "60ns",
         cxl_queue_depth_flits: int = 256,
+        cxl_extra_data_slots: int = 0,
         aes_latency: str = "0ns",
     ) -> None:
         super().__init__()
@@ -135,6 +136,7 @@ class TwoTierMemory(AbstractMemorySystem):
             bandwidth=cxl_link_bandwidth,
             m2s_latency=cxl_base_latency,
             s2m_latency=cxl_base_latency,
+            extra_data_slots=cxl_extra_data_slots,
             m2s_queue_depth_flits=cxl_queue_depth_flits,
             s2m_queue_depth_flits=cxl_queue_depth_flits,
         )
