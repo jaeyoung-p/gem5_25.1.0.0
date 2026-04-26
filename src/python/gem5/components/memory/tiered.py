@@ -36,6 +36,7 @@ from typing import (
 from m5.objects import (
     AbstractMemory,
     CxlMemLink,
+    IntegrityMemLink,
     MemCtrl,
 )
 from m5.params import (
@@ -85,8 +86,14 @@ class TwoTierMemory(AbstractMemorySystem):
         cxl_queue_depth_flits: int = 256,
         cxl_extra_data_slots: int = 0,
         aes_latency: str = "0ns",
+        integrity_mac_enable: bool = False,
+        integrity_mac_line_bytes: int = 64,
+        integrity_mac_bytes_per_line: int = 8,
     ) -> None:
         super().__init__()
+        self._integrity_mac_enable = integrity_mac_enable
+        self._integrity_mac_line_bytes = integrity_mac_line_bytes
+        self._integrity_mac_bytes_per_line = integrity_mac_bytes_per_line
 
         object.__setattr__(
             self,
@@ -107,6 +114,9 @@ class TwoTierMemory(AbstractMemorySystem):
         )
         object.__setattr__(self, "node0_channel_ranges", [])
         object.__setattr__(self, "node1_channel_ranges", [])
+        object.__setattr__(self, "node0_low_integrity_links", [])
+        object.__setattr__(self, "node0_high_integrity_links", [])
+        object.__setattr__(self, "node1_integrity_links", [])
 
         self.node0_low_ctrls = self._create_channel_group(
             num_channels=self._node0_channels,
@@ -200,6 +210,66 @@ class TwoTierMemory(AbstractMemorySystem):
 
         object.__setattr__(self, "node1_channel_ranges", slow_channel_ranges)
 
+    def _create_integrity_link(
+        self, name: str, visible_range: AddrRange, downstream_port: Port
+    ) -> IntegrityMemLink:
+        link = IntegrityMemLink(
+            visible_range=visible_range,
+            enable=self._integrity_mac_enable,
+            mac_line_bytes=self._integrity_mac_line_bytes,
+            mac_bytes_per_line=self._integrity_mac_bytes_per_line,
+        )
+        link.mem_side_port = downstream_port
+        return link
+
+    def _configure_integrity_links(self) -> None:
+        if not self._integrity_mac_enable:
+            object.__setattr__(self, "node0_low_integrity_links", [])
+            object.__setattr__(self, "node0_high_integrity_links", [])
+            object.__setattr__(self, "node1_integrity_links", [])
+            return
+        if (
+            self.node0_low_integrity_links
+            or self.node0_high_integrity_links
+            or self.node1_integrity_links
+        ):
+            return
+
+        node0_low_links = [
+            self._create_integrity_link(
+                f"node0_low_integrity{channel}",
+                self.node0_channel_ranges[channel],
+                self.node0_low_ctrls[channel].port,
+            )
+            for channel in range(self._node0_channels)
+        ]
+        node0_high_offset = self._node0_channels
+        node0_high_links = [
+            self._create_integrity_link(
+                f"node0_high_integrity{channel}",
+                self.node0_channel_ranges[node0_high_offset + channel],
+                self.node0_high_ctrls[channel].port,
+            )
+            for channel in range(self._node0_channels)
+        ]
+        node1_links = [
+            self._create_integrity_link(
+                f"node1_integrity{channel}",
+                self.node1_channel_ranges[channel],
+                self.slow_cxl_link.cpu_side_ports[channel],
+            )
+            for channel in range(self._node1_channels)
+        ]
+
+        object.__setattr__(self, "node0_low_integrity_links", node0_low_links)
+        object.__setattr__(
+            self, "node0_high_integrity_links", node0_high_links
+        )
+        object.__setattr__(self, "node1_integrity_links", node1_links)
+        self.add_child("node0_low_integrity_links", node0_low_links)
+        self.add_child("node0_high_integrity_links", node0_high_links)
+        self.add_child("node1_integrity_links", node1_links)
+
     def _all_controllers(self) -> List[MemCtrl]:
         return self._node0_ctrls + list(self.slow_ctrls)
 
@@ -250,6 +320,33 @@ class TwoTierMemory(AbstractMemorySystem):
 
     @overrides(AbstractMemorySystem)
     def get_mem_ports(self) -> Sequence[Tuple[object, Port]]:
+        if self._integrity_mac_enable:
+            return (
+                [
+                    (
+                        self.node0_channel_ranges[channel],
+                        self.node0_low_integrity_links[channel].cpu_side_port,
+                    )
+                    for channel in range(self._node0_channels)
+                ]
+                + [
+                    (
+                        self.node0_channel_ranges[
+                            self._node0_channels + channel
+                        ],
+                        self.node0_high_integrity_links[channel].cpu_side_port,
+                    )
+                    for channel in range(self._node0_channels)
+                ]
+                + [
+                    (
+                        self.node1_channel_ranges[channel],
+                        self.node1_integrity_links[channel].cpu_side_port,
+                    )
+                    for channel in range(self._node1_channels)
+                ]
+            )
+
         return [
             (
                 self.node0_channel_ranges[channel],
@@ -317,3 +414,4 @@ class TwoTierMemory(AbstractMemorySystem):
             self.slow_ctrls, self.node1_ranges[0], self._node1_channels
         )
         self._configure_slow_cxl_link()
+        self._configure_integrity_links()

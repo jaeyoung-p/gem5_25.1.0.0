@@ -151,8 +151,15 @@ MemCtrl::recvAtomicLogic(PacketPtr pkt, MemInterface* mem_intr)
     panic_if(pkt->cacheResponding(), "Should not see packets where cache "
              "is responding");
 
-    // do the actual memory access and turn the packet into a response
-    mem_intr->access(pkt);
+    const bool no_access = pkt->req->getFlags().isSet(Request::NO_ACCESS);
+    if (no_access) {
+        if (pkt->needsResponse()) {
+            pkt->makeResponse();
+        }
+    } else {
+        // do the actual memory access and turn the packet into a response
+        mem_intr->access(pkt);
+    }
 
     if (pkt->hasData()) {
         // this value is not supposed to be accurate, just enough to
@@ -636,10 +643,18 @@ MemCtrl::accessAndRespond(PacketPtr pkt, Tick static_latency,
 
     bool needsResponse = pkt->needsResponse();
     // do the actual memory access which also turns the packet into a
-    // response
+    // response. Integrity MAC timing packets deliberately use NO_ACCESS so
+    // they consume queues/bursts without touching guest-visible bytes.
     panic_if(!mem_intr->getAddrRange().contains(pkt->getAddr()),
              "Can't handle address range for packet %s\n", pkt->print());
-    mem_intr->access(pkt);
+    const bool no_access = pkt->req->getFlags().isSet(Request::NO_ACCESS);
+    if (no_access) {
+        if (needsResponse) {
+            pkt->makeResponse();
+        }
+    } else {
+        mem_intr->access(pkt);
+    }
 
     // turn packet around to go back to requestor if response expected
     if (needsResponse) {
